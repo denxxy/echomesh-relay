@@ -6,6 +6,6 @@ pub use noise::{
     ENCRYPTED_FRAME_SIZE, NOISE_PATTERN,
 };
 pub use obfuscation::{
-    parse_client_hello, ClientHelloStatus, ObfuscationError, ParsedClientHello, PseudoTlsBuilder,
-    TokenValidator,
+    hex_decode, hex_encode, parse_client_hello, ClientHelloStatus, ObfuscationError,
+    ParsedClientHello, PseudoTlsBuilder, TokenValidator,
 };

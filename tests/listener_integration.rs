@@ -191,3 +191,69 @@ async fn test_concurrency_semaphore_limits_connections() {
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;
 }
+
+#[tokio::test]
+async fn test_listener_returns_secrets_on_startup() {
+    let secret = b"my_verified_startup_secret_32bytes";
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = ListenerConfig::new(addr, secret.to_vec());
+
+    let listener = RelayListener::bind(config).await.unwrap();
+    let secrets = listener.secrets();
+
+    // Verify secret token returned matches input
+    assert_eq!(secrets.secret_token, secret);
+    assert_eq!(
+        secrets.secret_token_hex,
+        echomesh_relay::transport::hex_encode(secret)
+    );
+    assert_eq!(listener.secret_token(), secret);
+
+    // Verify public key generated and formatted as 64-char hex
+    assert_eq!(secrets.public_key.len(), 32);
+    assert_eq!(secrets.public_key_hex.len(), 64);
+    assert_eq!(listener.public_key_hex(), secrets.public_key_hex);
+
+    // Verify private key is 32 bytes
+    assert_eq!(secrets.private_key.len(), 32);
+    assert_eq!(secrets.private_key_hex.len(), 64);
+
+    // Verify URL formatting
+    assert!(secrets.url.starts_with("https://"));
+
+    // Verify security invariant: private key redacted in debug
+    let debug_str = format!("{:?}", secrets);
+    assert!(debug_str.contains("[REDACTED]"));
+    assert!(!debug_str.contains(&secrets.private_key_hex));
+}
+
+#[tokio::test]
+async fn test_relay_secrets_generate_random_token() {
+    use echomesh_relay::server::RelaySecrets;
+
+    let addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+    let secrets1 = RelaySecrets::generate(addr, None).expect("generate 1");
+    let secrets2 = RelaySecrets::generate(addr, None).expect("generate 2");
+
+    // Both generated tokens must be 32 bytes and distinct
+    assert_eq!(secrets1.secret_token.len(), 32);
+    assert_eq!(secrets2.secret_token.len(), 32);
+    assert_ne!(secrets1.secret_token, secrets2.secret_token);
+    assert_ne!(secrets1.public_key, secrets2.public_key);
+}
+
+#[tokio::test]
+async fn test_binary_secrets_cli_command() {
+    let output = tokio::process::Command::new("cargo")
+        .args(["run", "--quiet", "--", "--secrets", "--json"])
+        .output()
+        .await
+        .expect("run cargo run with --secrets --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"public_key_hex\":"));
+    assert!(stdout.contains("\"secret_token_hex\":"));
+    assert!(stdout.contains("\"url\":"));
+}
+

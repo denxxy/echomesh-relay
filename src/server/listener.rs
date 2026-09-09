@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -10,10 +11,107 @@ use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::protocol::frame::Frame;
-use crate::transport::noise::{server_noise_handshake, NoiseFramedStream};
+use crate::transport::noise::{server_noise_handshake, NoiseFramedStream, NOISE_PATTERN};
 use crate::transport::obfuscation::{
-    parse_client_hello, ClientHelloStatus, TokenValidator, MAX_CLIENT_HELLO_SIZE,
+    hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator, MAX_CLIENT_HELLO_SIZE,
 };
+
+/// Cryptographic secrets and connection identifiers for an EchoMesh Relay instance.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelaySecrets {
+    /// Pre-shared secret token for Reality/TLS camouflage authentication (raw bytes).
+    pub secret_token: Vec<u8>,
+    /// Pre-shared secret token encoded as hex string.
+    pub secret_token_hex: String,
+    /// Relay X25519 static public key (raw 32 bytes).
+    pub public_key: Vec<u8>,
+    /// Relay X25519 static public key encoded as hex string (64 characters).
+    pub public_key_hex: String,
+    /// Relay X25519 static private key (raw 32 bytes).
+    pub private_key: Vec<u8>,
+    /// Relay X25519 static private key encoded as hex string (64 characters).
+    pub private_key_hex: String,
+    /// Connection endpoint URL (e.g. "https://0.0.0.0:8443").
+    pub url: String,
+}
+
+impl fmt::Debug for RelaySecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redact private key per security invariant
+        f.debug_struct("RelaySecrets")
+            .field("url", &self.url)
+            .field("public_key_hex", &self.public_key_hex)
+            .field("secret_token_hex", &self.secret_token_hex)
+            .field("private_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for RelaySecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EchoMesh Relay Secrets:\n  URL: {}\n  Public Key (Hex): {}\n  Secret Token (Hex): {}",
+            self.url, self.public_key_hex, self.secret_token_hex
+        )
+    }
+}
+
+impl RelaySecrets {
+    /// Creates a new `RelaySecrets` bundle from explicit components.
+    pub fn new(
+        secret_token: Vec<u8>,
+        public_key: Vec<u8>,
+        private_key: Vec<u8>,
+        url: impl Into<String>,
+    ) -> Self {
+        let secret_token_hex = hex_encode(&secret_token);
+        let public_key_hex = hex_encode(&public_key);
+        let private_key_hex = hex_encode(&private_key);
+        Self {
+            secret_token,
+            secret_token_hex,
+            public_key,
+            public_key_hex,
+            private_key,
+            private_key_hex,
+            url: url.into(),
+        }
+    }
+
+    /// Generates a fresh `RelaySecrets` bundle using CSPRNG.
+    /// If `secret_token` is `None` or empty, a 32-byte secure random token is generated.
+    pub fn generate(
+        bind_addr: SocketAddr,
+        secret_token: Option<Vec<u8>>,
+    ) -> Result<Self, snow::Error> {
+        let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
+        let keypair = builder.generate_keypair()?;
+
+        let secret = match secret_token {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                let token_pair = builder.generate_keypair()?;
+                token_pair.public
+            }
+        };
+
+        let secret_token_hex = hex_encode(&secret);
+        let public_key_hex = hex_encode(&keypair.public);
+        let private_key_hex = hex_encode(&keypair.private);
+        let url = format!("https://{}", bind_addr);
+
+        Ok(Self {
+            secret_token: secret,
+            secret_token_hex,
+            public_key: keypair.public,
+            public_key_hex,
+            private_key: keypair.private,
+            private_key_hex,
+            url,
+        })
+    }
+}
 
 /// An asynchronous stream adapter that yields a prefixed buffer of bytes
 /// before delegating reads directly to the underlying stream.
@@ -102,18 +200,52 @@ pub struct ListenerConfig {
 
     /// Timeout for reading initial ClientHello bytes.
     pub handshake_timeout: Duration,
+
+    /// Cryptographic secrets bundle for relay authentication and client connection.
+    pub secrets: RelaySecrets,
 }
 
 impl ListenerConfig {
     /// Creates a new configuration with sensible security defaults.
     pub fn new(bind_addr: SocketAddr, secret_token: impl Into<Vec<u8>>) -> Self {
+        let token_bytes = secret_token.into();
+        let secrets = RelaySecrets::generate(bind_addr, Some(token_bytes.clone()))
+            .unwrap_or_else(|_| {
+                RelaySecrets::new(
+                    token_bytes.clone(),
+                    vec![0x42; 32],
+                    vec![0x42; 32],
+                    format!("https://{}", bind_addr),
+                )
+            });
+
         Self {
             bind_addr,
             max_connections: 1024,
             fallback_target: "cloudflare.com:443".to_string(),
-            secret_token: secret_token.into(),
+            secret_token: token_bytes,
             handshake_timeout: Duration::from_secs(5),
+            secrets,
         }
+    }
+
+    /// Creates a configuration with an explicit `RelaySecrets` bundle.
+    pub fn new_with_secrets(bind_addr: SocketAddr, secrets: RelaySecrets) -> Self {
+        Self {
+            bind_addr,
+            max_connections: 1024,
+            fallback_target: "cloudflare.com:443".to_string(),
+            secret_token: secrets.secret_token.clone(),
+            handshake_timeout: Duration::from_secs(5),
+            secrets,
+        }
+    }
+
+    /// Sets the secrets bundle.
+    pub fn with_secrets(mut self, secrets: RelaySecrets) -> Self {
+        self.secret_token = secrets.secret_token.clone();
+        self.secrets = secrets;
+        self
     }
 
     /// Sets the fallback target for unauthenticated requests and active DPI probes.
@@ -171,6 +303,26 @@ impl RelayListener {
     /// Returns the current number of active concurrent connections.
     pub fn active_connections(&self) -> usize {
         self.config.max_connections - self.semaphore.available_permits()
+    }
+
+    /// Returns the active cryptographic secrets and client connection credentials.
+    pub fn secrets(&self) -> &RelaySecrets {
+        &self.config.secrets
+    }
+
+    /// Returns the pre-shared secret token for obfuscation authentication.
+    pub fn secret_token(&self) -> &[u8] {
+        &self.config.secrets.secret_token
+    }
+
+    /// Returns the hex-encoded public key for client configuration.
+    pub fn public_key_hex(&self) -> &str {
+        &self.config.secrets.public_key_hex
+    }
+
+    /// Returns the active listener configuration.
+    pub fn config(&self) -> &ListenerConfig {
+        &self.config
     }
 
     /// Runs the listener accept loop until an unrecoverable error occurs.

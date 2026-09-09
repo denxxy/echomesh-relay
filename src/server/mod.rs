@@ -1,3 +1,3 @@
 pub mod listener;
 
-pub use listener::{ListenerConfig, PrefixedStream, RelayListener};
+pub use listener::{ListenerConfig, PrefixedStream, RelayListener, RelaySecrets};

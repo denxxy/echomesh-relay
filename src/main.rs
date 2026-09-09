@@ -7,11 +7,13 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use echomesh_relay::server::{ListenerConfig, RelayListener};
+use echomesh_relay::server::{ListenerConfig, RelayListener, RelaySecrets};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+
+    let args: Vec<String> = std::env::args().collect();
 
     let bind_str = std::env::var("ECHOMESH_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let bind_addr: SocketAddr = bind_str.parse().map_err(|e| {
@@ -19,9 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
-    let secret_token = std::env::var("ECHOMESH_SECRET")
-        .unwrap_or_else(|_| "echomesh_default_pre_shared_secret_32bytes".to_string())
-        .into_bytes();
+    let secret_token_opt = std::env::var("ECHOMESH_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.into_bytes());
 
     let fallback_target = std::env::var("ECHOMESH_FALLBACK_TARGET")
         .unwrap_or_else(|_| "cloudflare.com:443".to_string());
@@ -31,13 +34,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096);
 
-    let config = ListenerConfig::new(bind_addr, secret_token)
+    let secrets = RelaySecrets::generate(bind_addr, secret_token_opt)?;
+
+    // Handle CLI inspection flags: --secrets or --show-secrets or --json
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    if args.iter().any(|arg| arg == "--secrets" || arg == "--show-secrets") {
+        if wants_json {
+            println!(
+                r#"{{"url":"{}","public_key_hex":"{}","secret_token_hex":"{}","secret_token":"{}"}}"#,
+                secrets.url,
+                secrets.public_key_hex,
+                secrets.secret_token_hex,
+                String::from_utf8_lossy(&secrets.secret_token)
+            );
+        } else {
+            println!("{}", secrets);
+        }
+        return Ok(());
+    }
+
+    let config = ListenerConfig::new_with_secrets(bind_addr, secrets.clone())
         .with_fallback_target(fallback_target)
         .with_max_connections(max_connections)
         .with_handshake_timeout(Duration::from_secs(5));
 
     let listener = RelayListener::bind(config).await?;
-    info!("echomesh-relay started on {}", bind_addr);
+
+    // Return secrets prominently on startup to stdout
+    if wants_json {
+        println!(
+            r#"{{"url":"{}","public_key_hex":"{}","secret_token_hex":"{}","secret_token":"{}"}}"#,
+            secrets.url,
+            secrets.public_key_hex,
+            secrets.secret_token_hex,
+            String::from_utf8_lossy(&secrets.secret_token)
+        );
+    } else {
+        println!(
+            r#"
+================================================================================
+                    ECHOMESH STATELESS RELAY INITIALIZED
+================================================================================
+  Server Bind:           {}
+  Fallback Camouflage:   {}
+  Max Connections:       {}
+
+  [AUTHENTICATION & CRYPTO SECRETS]
+  Secret Token (Raw):    {}
+  Secret Token (Hex):    {}
+  Public Key (Hex):      {}
+
+  [CLIENT CONFIGURATION / MTGRAM SETTINGS]
+  Relay URL:             {}
+  Relay Public Key:      {}
+================================================================================
+"#,
+            bind_addr,
+            listener.config().fallback_target,
+            listener.config().max_connections,
+            String::from_utf8_lossy(&secrets.secret_token),
+            secrets.secret_token_hex,
+            secrets.public_key_hex,
+            secrets.url,
+            secrets.public_key_hex,
+        );
+    }
+
+    info!(
+        url = %secrets.url,
+        public_key_hex = %secrets.public_key_hex,
+        secret_token_hex = %secrets.secret_token_hex,
+        "echomesh-relay started successfully"
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
