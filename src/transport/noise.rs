@@ -1,0 +1,267 @@
+use std::fmt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::protocol::frame::{Frame, FrameCodec, FRAME_SIZE};
+use crate::protocol::ProtocolError;
+
+/// Noise Protocol handshake pattern: Noise_NN_25519_ChaChaPoly_BLAKE2s
+pub const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
+
+/// Maximum Noise message size per specification (65535 bytes).
+pub const MAX_NOISE_MSG_LEN: usize = 65535;
+
+/// Poly1305 authentication tag overhead in bytes.
+pub const NOISE_TAG_LEN: usize = 16;
+
+/// Encrypted frame size on wire (1420 frame + 16 tag = 1436 bytes).
+pub const ENCRYPTED_FRAME_SIZE: usize = FRAME_SIZE + NOISE_TAG_LEN;
+
+/// Errors in the Noise transport and handshake layer.
+#[derive(Debug, thiserror::Error)]
+pub enum NoiseError {
+    #[error("Noise cryptographic error: {0}")]
+    Snow(#[from] snow::Error),
+
+    #[error("I/O error during Noise communication: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Protocol frame error: {0}")]
+    Protocol(#[from] ProtocolError),
+
+    #[error("Unexpected message size: expected {expected}, got {actual}")]
+    BadMessageSize { expected: usize, actual: usize },
+
+    #[error("Stream closed unexpectedly")]
+    StreamClosed,
+}
+
+/// An active Noise transport session with encrypted state.
+pub struct NoiseSession {
+    transport: snow::TransportState,
+}
+
+impl fmt::Debug for NoiseSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redact cryptographic state per security invariant
+        f.debug_struct("NoiseSession")
+            .field("pattern", &NOISE_PATTERN)
+            .field("state", &"[ENCRYPTED]")
+            .finish()
+    }
+}
+
+impl NoiseSession {
+    /// Creates a new `NoiseSession` wrapping an established `snow::TransportState`.
+    pub fn new(transport: snow::TransportState) -> Self {
+        Self { transport }
+    }
+
+    /// Encrypts an outgoing EchoMesh binary frame into a framed buffer.
+    pub fn encrypt_frame(&mut self, frame: &Frame) -> Result<Vec<u8>, NoiseError> {
+        let mut raw_frame = bytes::BytesMut::with_capacity(FRAME_SIZE);
+        let mut codec = FrameCodec::new();
+        tokio_util::codec::Encoder::encode(&mut codec, frame.clone(), &mut raw_frame)?;
+
+        let mut cipher_text = vec![0u8; raw_frame.len() + NOISE_TAG_LEN];
+        let n = self.transport.write_message(&raw_frame, &mut cipher_text)?;
+        cipher_text.truncate(n);
+
+        // Prepend 2-byte big endian length prefix for stream framing
+        let mut packet = Vec::with_capacity(2 + cipher_text.len());
+        packet.extend_from_slice(&(cipher_text.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&cipher_text);
+
+        Ok(packet)
+    }
+
+    /// Decrypts an incoming cipher buffer into an EchoMesh `Frame`.
+    pub fn decrypt_frame(&mut self, cipher_text: &[u8]) -> Result<Frame, NoiseError> {
+        let mut plain_buf = vec![0u8; cipher_text.len()];
+        let n = self.transport.read_message(cipher_text, &mut plain_buf)?;
+        plain_buf.truncate(n);
+
+        let frame = Frame::from_slice(&plain_buf)?;
+        Ok(frame)
+    }
+
+    /// Encrypts raw bytes.
+    pub fn encrypt(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, NoiseError> {
+        let len = self.transport.write_message(payload, out)?;
+        Ok(len)
+    }
+
+    /// Decrypts raw bytes.
+    pub fn decrypt(&mut self, packet: &[u8], out: &mut [u8]) -> Result<usize, NoiseError> {
+        let len = self.transport.read_message(packet, out)?;
+        Ok(len)
+    }
+}
+
+/// Helper to execute the server-side Noise handshake over an async stream.
+pub async fn server_noise_handshake<S>(stream: &mut S) -> Result<NoiseSession, NoiseError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let builder: snow::Builder = snow::Builder::new(
+        NOISE_PATTERN
+            .parse()
+            .map_err(|e: snow::Error| NoiseError::Snow(e))?,
+    );
+    let mut responder = builder.build_responder()?;
+
+    // 1. Read message 1 length and payload from client (-> e)
+    let msg1_len = stream.read_u16().await? as usize;
+    let mut msg1 = vec![0u8; msg1_len];
+    stream.read_exact(&mut msg1).await?;
+
+    let mut dummy_payload = [0u8; 128];
+    responder.read_message(&msg1, &mut dummy_payload)?;
+
+    // 2. Generate and write message 2 to client (<- e, ee)
+    let mut msg2 = vec![0u8; 128];
+    let n2 = responder.write_message(&[], &mut msg2)?;
+    msg2.truncate(n2);
+
+    stream.write_u16(n2 as u16).await?;
+    stream.write_all(&msg2).await?;
+    stream.flush().await?;
+
+    let transport = responder.into_transport_mode()?;
+    Ok(NoiseSession::new(transport))
+}
+
+/// Helper to execute the client-side Noise handshake over an async stream.
+pub async fn client_noise_handshake<S>(stream: &mut S) -> Result<NoiseSession, NoiseError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let builder: snow::Builder = snow::Builder::new(
+        NOISE_PATTERN
+            .parse()
+            .map_err(|e: snow::Error| NoiseError::Snow(e))?,
+    );
+    let mut initiator = builder.build_initiator()?;
+
+    // 1. Generate and send message 1 (-> e)
+    let mut msg1 = vec![0u8; 128];
+    let n1 = initiator.write_message(&[], &mut msg1)?;
+    msg1.truncate(n1);
+
+    stream.write_u16(n1 as u16).await?;
+    stream.write_all(&msg1).await?;
+    stream.flush().await?;
+
+    // 2. Read message 2 from server (<- e, ee)
+    let msg2_len = stream.read_u16().await? as usize;
+    let mut msg2 = vec![0u8; msg2_len];
+    stream.read_exact(&mut msg2).await?;
+
+    let mut dummy_payload = [0u8; 128];
+    initiator.read_message(&msg2, &mut dummy_payload)?;
+
+    let transport = initiator.into_transport_mode()?;
+    Ok(NoiseSession::new(transport))
+}
+
+/// Async transport helper for reading and writing encrypted EchoMesh frames over a stream.
+pub struct NoiseFramedStream<S> {
+    stream: S,
+    session: NoiseSession,
+}
+
+impl<S> NoiseFramedStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(stream: S, session: NoiseSession) -> Self {
+        Self { stream, session }
+    }
+
+    /// Sends an encrypted frame.
+    pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), NoiseError> {
+        let packet = self.session.encrypt_frame(frame)?;
+        self.stream.write_all(&packet).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Receives and decrypts a frame.
+    pub async fn recv_frame(&mut self) -> Result<Option<Frame>, NoiseError> {
+        let len = match self.stream.read_u16().await {
+            Ok(len) => len as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(NoiseError::Io(e)),
+        };
+
+        if len > ENCRYPTED_FRAME_SIZE {
+            return Err(NoiseError::BadMessageSize {
+                expected: ENCRYPTED_FRAME_SIZE,
+                actual: len,
+            });
+        }
+
+        let mut buf = vec![0u8; len];
+        self.stream.read_exact(&mut buf).await?;
+        let frame = self.session.decrypt_frame(&buf)?;
+        Ok(Some(frame))
+    }
+
+    pub fn session(&self) -> &NoiseSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut NoiseSession {
+        &mut self.session
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn test_noise_handshake_and_frame_exchange() {
+        let (mut client_io, mut server_io) = duplex(4096);
+
+        let client_task = tokio::spawn(async move {
+            let session = client_noise_handshake(&mut client_io).await.unwrap();
+            let mut framed = NoiseFramedStream::new(client_io, session);
+
+            let frame = Frame::new(
+                [0x42; 16],
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                Bytes::from_static(b"Hello Noise Security!"),
+            )
+            .unwrap();
+
+            framed.send_frame(&frame).await.unwrap();
+            let response = framed.recv_frame().await.unwrap().unwrap();
+            assert_eq!(response.payload, Bytes::from_static(b"Noise Echo Response"));
+        });
+
+        let server_task = tokio::spawn(async move {
+            let session = server_noise_handshake(&mut server_io).await.unwrap();
+            let mut framed = NoiseFramedStream::new(server_io, session);
+
+            let frame = framed.recv_frame().await.unwrap().unwrap();
+            assert_eq!(
+                frame.payload,
+                Bytes::from_static(b"Hello Noise Security!")
+            );
+
+            let reply = Frame::new(
+                frame.session_id,
+                [8, 7, 6, 5, 4, 3, 2, 1],
+                Bytes::from_static(b"Noise Echo Response"),
+            )
+            .unwrap();
+            framed.send_frame(&reply).await.unwrap();
+        });
+
+        let (c, s) = tokio::join!(client_task, server_task);
+        c.unwrap();
+        s.unwrap();
+    }
+}

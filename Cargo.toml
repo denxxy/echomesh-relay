@@ -10,7 +10,17 @@ bytes = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+snow = "0.10"
 
 [profile.release]
 lto = true
 codegen-units = 1
+strip = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+libc = "0.2"
+
+[[bench]]
+name = "throughput"
+harness = false
