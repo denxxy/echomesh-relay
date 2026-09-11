@@ -215,3 +215,39 @@ fn test_resolve_key_file_path() {
         PathBuf::from("/var/relay.key")
     );
 }
+
+#[test]
+fn test_show_public_key_works_when_port_is_already_bound() {
+
+    let temp_dir = TempDirGuard::new("port_bound");
+    let key_path = temp_dir.path().join("relay.key");
+    let keypair = load_or_generate_keypair(&key_path).expect("generate initial keypair");
+
+    // Bind a TCP listener to occupy an address
+    let occupied_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind occupied port");
+    let occupied_addr = occupied_listener.local_addr().expect("local addr");
+
+    // Execute show-public-key with ECHOMESH_BIND_ADDR pointing to the already occupied address.
+    // If the binary attempted to bind or touch the network, it would fail with AddrInUse (os error 98).
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "--",
+            "--show-public-key",
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .env("ECHOMESH_BIND_ADDR", occupied_addr.to_string())
+        .output()
+        .expect("run show-public-key with occupied bind addr");
+
+    assert!(
+        output.status.success(),
+        "Command failed when port was occupied: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), keypair.public_key_base64);
+}
+

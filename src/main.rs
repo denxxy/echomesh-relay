@@ -10,8 +10,27 @@ use tracing::{error, info};
 use echomesh_relay::crypto::{load_or_generate_keypair, resolve_key_file_path};
 use echomesh_relay::server::{ListenerConfig, RelayListener, RelaySecrets};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Early exit for --show-public-key or subcommand show-key:
+    // Strictly evaluated at the very start of main before any network runtime initialization,
+    // socket binding, address resolution, or tracing subscriber setup.
+    if args.iter().any(|arg| arg == "--show-public-key" || arg == "show-key") {
+        let key_file = resolve_key_file_path(&args);
+        let keypair = load_or_generate_keypair(&key_file)?;
+        println!("{}", keypair.public_key_base64);
+        return Ok(());
+    }
+
+    // Initialize tokio async runtime only for daemon execution
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_daemon(args))
+}
+
+async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing-subscriber with fallback to INFO level
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -20,15 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
     let key_file = resolve_key_file_path(&args);
-
-    // Handle CLI inspection flags: --show-public-key or subcommand show-key
-    if args.iter().any(|arg| arg == "--show-public-key" || arg == "show-key") {
-        let keypair = load_or_generate_keypair(&key_file)?;
-        println!("{}", keypair.public_key_base64);
-        return Ok(());
-    }
 
     let bind_str = std::env::var("ECHOMESH_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let bind_addr: SocketAddr = bind_str.parse().map_err(|e| {
