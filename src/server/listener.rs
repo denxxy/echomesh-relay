@@ -27,12 +27,16 @@ pub struct RelaySecrets {
     pub public_key: Vec<u8>,
     /// Relay X25519 static public key encoded as hex string (64 characters).
     pub public_key_hex: String,
+    /// Relay X25519 static public key encoded as Base64 string.
+    pub public_key_base64: String,
     /// Relay X25519 static private key (raw 32 bytes).
     pub private_key: Vec<u8>,
     /// Relay X25519 static private key encoded as hex string (64 characters).
     pub private_key_hex: String,
     /// Connection endpoint URL (e.g. "https://0.0.0.0:8443").
     pub url: String,
+    /// Persistent key file path on disk, if loaded from or saved to a file.
+    pub key_file: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for RelaySecrets {
@@ -41,7 +45,9 @@ impl fmt::Debug for RelaySecrets {
         f.debug_struct("RelaySecrets")
             .field("url", &self.url)
             .field("public_key_hex", &self.public_key_hex)
+            .field("public_key_base64", &self.public_key_base64)
             .field("secret_token_hex", &self.secret_token_hex)
+            .field("key_file", &self.key_file)
             .field("private_key", &"[REDACTED]")
             .finish()
     }
@@ -51,8 +57,8 @@ impl fmt::Display for RelaySecrets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "EchoMesh Relay Secrets:\n  URL: {}\n  Public Key (Hex): {}\n  Secret Token (Hex): {}",
-            self.url, self.public_key_hex, self.secret_token_hex
+            "EchoMesh Relay Secrets:\n  URL: {}\n  Public Key (Hex): {}\n  Public Key (Base64): {}\n  Secret Token (Hex): {}",
+            self.url, self.public_key_hex, self.public_key_base64, self.secret_token_hex
         )
     }
 }
@@ -67,15 +73,18 @@ impl RelaySecrets {
     ) -> Self {
         let secret_token_hex = hex_encode(&secret_token);
         let public_key_hex = hex_encode(&public_key);
+        let public_key_base64 = crate::crypto::base64_encode(&public_key);
         let private_key_hex = hex_encode(&private_key);
         Self {
             secret_token,
             secret_token_hex,
             public_key,
             public_key_hex,
+            public_key_base64,
             private_key,
             private_key_hex,
             url: url.into(),
+            key_file: None,
         }
     }
 
@@ -98,6 +107,7 @@ impl RelaySecrets {
 
         let secret_token_hex = hex_encode(&secret);
         let public_key_hex = hex_encode(&keypair.public);
+        let public_key_base64 = crate::crypto::base64_encode(&keypair.public);
         let private_key_hex = hex_encode(&keypair.private);
         let url = format!("https://{}", bind_addr);
 
@@ -106,10 +116,55 @@ impl RelaySecrets {
             secret_token_hex,
             public_key: keypair.public,
             public_key_hex,
+            public_key_base64,
             private_key: keypair.private,
             private_key_hex,
             url,
+            key_file: None,
         })
+    }
+
+    /// Creates a `RelaySecrets` bundle from a pre-loaded persistent `KeyPair`.
+    pub fn from_keypair(
+        bind_addr: SocketAddr,
+        keypair: crate::crypto::KeyPair,
+        secret_token: Option<Vec<u8>>,
+    ) -> Result<Self, snow::Error> {
+        let secret = match secret_token {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
+                let token_pair = builder.generate_keypair()?;
+                token_pair.public
+            }
+        };
+
+        let secret_token_hex = hex_encode(&secret);
+        let public_key_hex = hex_encode(&keypair.public_key);
+        let private_key_hex = hex_encode(&keypair.private_key);
+        let url = format!("https://{}", bind_addr);
+
+        Ok(Self {
+            secret_token: secret,
+            secret_token_hex,
+            public_key: keypair.public_key,
+            public_key_hex,
+            public_key_base64: keypair.public_key_base64,
+            private_key: keypair.private_key,
+            private_key_hex,
+            url,
+            key_file: Some(keypair.key_path),
+        })
+    }
+
+    /// Loads an existing key or generates a persistent key at `key_path` and creates `RelaySecrets`.
+    pub fn load_or_generate(
+        key_path: &std::path::Path,
+        bind_addr: SocketAddr,
+        secret_token: Option<Vec<u8>>,
+    ) -> Result<Self, crate::crypto::KeyError> {
+        let keypair = crate::crypto::load_or_generate_keypair(key_path)?;
+        Ok(Self::from_keypair(bind_addr, keypair, secret_token)?)
     }
 }
 
@@ -319,6 +374,12 @@ impl RelayListener {
     pub fn public_key_hex(&self) -> &str {
         &self.config.secrets.public_key_hex
     }
+
+    /// Returns the Base64-encoded public key for client configuration.
+    pub fn public_key_base64(&self) -> &str {
+        &self.config.secrets.public_key_base64
+    }
+
 
     /// Returns the active listener configuration.
     pub fn config(&self) -> &ListenerConfig {
