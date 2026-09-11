@@ -4,8 +4,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::protocol::frame::{Frame, FrameCodec, FRAME_SIZE};
 use crate::protocol::ProtocolError;
 
-/// Noise Protocol handshake pattern: Noise_NN_25519_ChaChaPoly_BLAKE2s
-pub const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
+/// Noise Protocol handshake pattern: Noise_NK_25519_ChaChaPoly_BLAKE2s
+pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+
+/// Noise protocol prologue (empty by default for both server and client)
+pub const NOISE_PROLOGUE: &[u8] = b"";
 
 /// Maximum Noise message size per specification (65535 bytes).
 pub const MAX_NOISE_MSG_LEN: usize = 65535;
@@ -98,51 +101,97 @@ impl NoiseSession {
 }
 
 /// Helper to execute the server-side Noise handshake over an async stream.
-pub async fn server_noise_handshake<S>(stream: &mut S) -> Result<NoiseSession, NoiseError>
+pub async fn server_noise_handshake<S>(
+    stream: &mut S,
+    server_private_key: &[u8],
+    peer_addr: Option<std::net::SocketAddr>,
+) -> Result<NoiseSession, NoiseError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let builder: snow::Builder = snow::Builder::new(
+    let mut builder = snow::Builder::new(
         NOISE_PATTERN
             .parse()
             .map_err(|e: snow::Error| NoiseError::Snow(e))?,
     );
-    let mut responder = builder.build_responder()?;
+    if !NOISE_PROLOGUE.is_empty() {
+        builder = builder.prologue(NOISE_PROLOGUE)?;
+    }
+    let mut responder = builder
+        .local_private_key(server_private_key)?
+        .build_responder()?;
 
-    // 1. Read message 1 length and payload from client (-> e)
-    let msg1_len = stream.read_u16().await? as usize;
+    tracing::debug!(?peer_addr, "Noise responder initialized (pattern: {}), waiting for message 1", NOISE_PATTERN);
+
+    // 1. Read message 1 length and payload from client (-> e, es)
+    let msg1_len = match stream.read_u16().await {
+        Ok(len) => len as usize,
+        Err(e) => {
+            tracing::error!(?peer_addr, error = ?e, "Failed reading Noise message 1 length from stream");
+            return Err(NoiseError::Io(e));
+        }
+    };
+
     let mut msg1 = vec![0u8; msg1_len];
-    stream.read_exact(&mut msg1).await?;
+    if let Err(e) = stream.read_exact(&mut msg1).await {
+        tracing::error!(?peer_addr, error = ?e, msg1_len, "Failed reading Noise message 1 payload from stream");
+        return Err(NoiseError::Io(e));
+    }
 
     let mut dummy_payload = [0u8; 128];
-    responder.read_message(&msg1, &mut dummy_payload)?;
+    if let Err(e) = responder.read_message(&msg1, &mut dummy_payload) {
+        tracing::error!(
+            ?peer_addr,
+            error = ?e,
+            msg1_len,
+            "Noise responder.read_message() failed on message 1"
+        );
+        return Err(NoiseError::Snow(e));
+    }
+    tracing::debug!(?peer_addr, msg1_len, "Noise handshake message 1 processed successfully");
 
     // 2. Generate and write message 2 to client (<- e, ee)
     let mut msg2 = vec![0u8; 128];
-    let n2 = responder.write_message(&[], &mut msg2)?;
+    let n2 = match responder.write_message(&[], &mut msg2) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?peer_addr, error = ?e, "Noise responder.write_message() failed on message 2");
+            return Err(NoiseError::Snow(e));
+        }
+    };
     msg2.truncate(n2);
 
     stream.write_u16(n2 as u16).await?;
     stream.write_all(&msg2).await?;
     stream.flush().await?;
+    tracing::debug!(?peer_addr, msg2_len = n2, "Noise handshake message 2 sent to client");
 
     let transport = responder.into_transport_mode()?;
+    tracing::debug!(?peer_addr, "Noise handshake completed successfully; entered transport mode");
     Ok(NoiseSession::new(transport))
 }
 
 /// Helper to execute the client-side Noise handshake over an async stream.
-pub async fn client_noise_handshake<S>(stream: &mut S) -> Result<NoiseSession, NoiseError>
+pub async fn client_noise_handshake<S>(
+    stream: &mut S,
+    server_public_key: &[u8],
+) -> Result<NoiseSession, NoiseError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let builder: snow::Builder = snow::Builder::new(
+    let mut builder = snow::Builder::new(
         NOISE_PATTERN
             .parse()
             .map_err(|e: snow::Error| NoiseError::Snow(e))?,
     );
-    let mut initiator = builder.build_initiator()?;
+    if !NOISE_PROLOGUE.is_empty() {
+        builder = builder.prologue(NOISE_PROLOGUE)?;
+    }
+    let mut initiator = builder
+        .remote_public_key(server_public_key)?
+        .build_initiator()?;
 
-    // 1. Generate and send message 1 (-> e)
+    // 1. Generate and send message 1 (-> e, es)
     let mut msg1 = vec![0u8; 128];
     let n1 = initiator.write_message(&[], &mut msg1)?;
     msg1.truncate(n1);
@@ -225,8 +274,15 @@ mod tests {
     async fn test_noise_handshake_and_frame_exchange() {
         let (mut client_io, mut server_io) = duplex(4096);
 
+        let builder = snow::Builder::new(NOISE_PATTERN.parse().unwrap());
+        let server_keypair = builder.generate_keypair().unwrap();
+        let server_pub = server_keypair.public.clone();
+        let server_priv = server_keypair.private.clone();
+
         let client_task = tokio::spawn(async move {
-            let session = client_noise_handshake(&mut client_io).await.unwrap();
+            let session = client_noise_handshake(&mut client_io, &server_pub)
+                .await
+                .unwrap();
             let mut framed = NoiseFramedStream::new(client_io, session);
 
             let frame = Frame::new(
@@ -242,7 +298,9 @@ mod tests {
         });
 
         let server_task = tokio::spawn(async move {
-            let session = server_noise_handshake(&mut server_io).await.unwrap();
+            let session = server_noise_handshake(&mut server_io, &server_priv, None)
+                .await
+                .unwrap();
             let mut framed = NoiseFramedStream::new(server_io, session);
 
             let frame = framed.recv_frame().await.unwrap().unwrap();

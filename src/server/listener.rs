@@ -399,12 +399,12 @@ impl RelayListener {
     ) -> Result<(), std::io::Error> {
         loop {
             // Accept connection from TCP socket
-            let (stream, _peer_addr) = tokio::select! {
+            let (stream, peer_addr) = tokio::select! {
                 accept_res = self.listener.accept() => {
                     match accept_res {
                         Ok(conn) => conn,
-                        Err(_err) => {
-                            warn!("failed to accept incoming socket connection");
+                        Err(err) => {
+                            warn!("failed to accept incoming socket connection: {:?}", err);
                             continue;
                         }
                     }
@@ -445,7 +445,7 @@ impl RelayListener {
             // Spawn lightweight task for each connection
             tokio::spawn(async move {
                 let _permit = permit; // Owned permit is held for lifecycle of connection
-                handle_connection(stream, config, validator).await;
+                handle_connection(stream, config, validator, peer_addr).await;
             });
         }
 
@@ -462,7 +462,10 @@ async fn handle_connection(
     mut client_stream: TcpStream,
     config: Arc<ListenerConfig>,
     validator: TokenValidator,
+    peer_addr: SocketAddr,
 ) {
+    debug!(%peer_addr, "accepted new TCP connection");
+
     let mut initial_buf = Vec::new();
     let mut temp = [0u8; 1024];
 
@@ -470,75 +473,123 @@ async fn handle_connection(
     let read_result =
         tokio::time::timeout(config.handshake_timeout, client_stream.read(&mut temp)).await;
 
-    let _n = match read_result {
+    let n = match read_result {
         Ok(Ok(n)) if n > 0 => {
             initial_buf.extend_from_slice(&temp[..n]);
             n
         }
-        _ => return, // Connection closed or timed out before receiving data
+        Ok(Ok(_)) => {
+            debug!(%peer_addr, "incoming connection closed by peer before sending data");
+            return;
+        }
+        Ok(Err(err)) => {
+            warn!(%peer_addr, ?err, "I/O error reading initial data from incoming connection");
+            return;
+        }
+        Err(_) => {
+            warn!(%peer_addr, "handshake timeout waiting for initial data");
+            return;
+        }
     };
 
-    // Determine if initial packet contains authenticated TLS ClientHello
-    let mut consumed_len = 0;
-    let is_authenticated = match parse_client_hello(&initial_buf) {
-        ClientHelloStatus::Complete(parsed) => {
-            if initial_buf.len() >= 5 {
-                let rec_len = u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
-                consumed_len = 5 + rec_len;
+    let hex_prefix = hex_encode(&initial_buf[..initial_buf.len().min(16)]);
+    debug!(%peer_addr, bytes_read = n, hex_prefix = %hex_prefix, "read first incoming message");
+
+    // Check if initial packet is TLS Handshake (Pseudo-TLS) or direct Noise handshake
+    if initial_buf[0] == crate::transport::obfuscation::TLS_HANDSHAKE_CONTENT_TYPE {
+        debug!(%peer_addr, "detected TLS record header (0x16), parsing ClientHello");
+        let mut consumed_len = 0;
+        let is_authenticated = match parse_client_hello(&initial_buf) {
+            ClientHelloStatus::Complete(parsed) => {
+                if initial_buf.len() >= 5 {
+                    let rec_len = u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
+                    consumed_len = 5 + rec_len;
+                }
+                let valid = validator.validate(&parsed);
+                debug!(
+                    %peer_addr,
+                    is_valid = valid,
+                    sni = ?parsed.sni,
+                    is_tls13 = parsed.is_tls13,
+                    "ClientHello parsed"
+                );
+                valid
             }
-            validator.validate(&parsed)
-        }
-        ClientHelloStatus::NeedMoreData {
-            expected_record_len,
-        } => {
-            // Read remaining bytes of the record if within bounds
-            let needed = expected_record_len
-                .saturating_sub(initial_buf.len())
-                .min(MAX_CLIENT_HELLO_SIZE);
-            if needed > 0 {
-                let mut rest = vec![0u8; needed];
-                if let Ok(Ok(_)) = tokio::time::timeout(
-                    config.handshake_timeout,
-                    client_stream.read_exact(&mut rest),
-                )
-                .await
-                {
-                    initial_buf.extend_from_slice(&rest);
-                    if let ClientHelloStatus::Complete(parsed) = parse_client_hello(&initial_buf) {
-                        if initial_buf.len() >= 5 {
-                            let rec_len =
-                                u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
-                            consumed_len = 5 + rec_len;
+            ClientHelloStatus::NeedMoreData {
+                expected_record_len,
+            } => {
+                debug!(%peer_addr, expected_record_len, "ClientHello needs more data from stream");
+                let needed = expected_record_len
+                    .saturating_sub(initial_buf.len())
+                    .min(MAX_CLIENT_HELLO_SIZE);
+                if needed > 0 {
+                    let mut rest = vec![0u8; needed];
+                    if let Ok(Ok(_)) = tokio::time::timeout(
+                        config.handshake_timeout,
+                        client_stream.read_exact(&mut rest),
+                    )
+                    .await
+                    {
+                        initial_buf.extend_from_slice(&rest);
+                        if let ClientHelloStatus::Complete(parsed) = parse_client_hello(&initial_buf) {
+                            if initial_buf.len() >= 5 {
+                                let rec_len =
+                                    u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
+                                consumed_len = 5 + rec_len;
+                            }
+                            let valid = validator.validate(&parsed);
+                            debug!(%peer_addr, is_valid = valid, "ClientHello parsed after reading full record");
+                            valid
+                        } else {
+                            false
                         }
-                        validator.validate(&parsed)
                     } else {
                         false
                     }
                 } else {
                     false
                 }
-            } else {
+            }
+            ClientHelloStatus::Invalid(err) => {
+                debug!(%peer_addr, ?err, "ClientHello parsing marked invalid");
                 false
             }
-        }
-        ClientHelloStatus::Invalid(_) => false,
-    };
-
-    if is_authenticated {
-        debug!("client authenticated via pseudo-tls handshake; switching to noise protocol");
-        let leftover = if initial_buf.len() > consumed_len {
-            initial_buf[consumed_len..].to_vec()
-        } else {
-            Vec::new()
         };
-        let mut stream = PrefixedStream::new(leftover, client_stream);
-        if let Err(_err) = handle_authenticated_noise_session(&mut stream).await {
-            debug!("authenticated session terminated");
+
+        if is_authenticated {
+            debug!(%peer_addr, "client authenticated via pseudo-tls handshake; switching to noise protocol");
+            let leftover = if initial_buf.len() > consumed_len {
+                initial_buf[consumed_len..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let mut stream = PrefixedStream::new(leftover, client_stream);
+            if let Err(err) = handle_authenticated_noise_session(&mut stream, &config.secrets.private_key, peer_addr).await {
+                warn!("Handshake rejected from {}: {:?}", peer_addr, err);
+            }
+        } else {
+            debug!(%peer_addr, "unauthenticated TLS client or active scanner detected; proxying to fallback target");
+            fall_through_proxy(client_stream, &config.fallback_target, &initial_buf).await;
         }
     } else {
-        // Fall-through proxying to legitimate website (e.g. Microsoft or Cloudflare)
-        debug!("unauthenticated client or active scanner detected; proxying to fallback target");
-        fall_through_proxy(client_stream, &config.fallback_target, &initial_buf).await;
+        // Not a TLS record (e.g. direct Noise handshake or HTTP probe)
+        let msg_len = if initial_buf.len() >= 2 {
+            u16::from_be_bytes([initial_buf[0], initial_buf[1]]) as usize
+        } else {
+            0
+        };
+
+        // Direct Noise handshake: 2-byte big-endian message length (NK message 1 is 48 bytes)
+        if msg_len >= 32 && msg_len <= 128 {
+            debug!(%peer_addr, msg_len, "detected direct Noise handshake message, initiating session");
+            let mut stream = PrefixedStream::new(initial_buf, client_stream);
+            if let Err(err) = handle_authenticated_noise_session(&mut stream, &config.secrets.private_key, peer_addr).await {
+                warn!("Handshake rejected from {}: {:?}", peer_addr, err);
+            }
+        } else {
+            debug!(%peer_addr, "unrecognized packet format or HTTP probe; proxying to fallback target");
+            fall_through_proxy(client_stream, &config.fallback_target, &initial_buf).await;
+        }
     }
 }
 
@@ -586,19 +637,23 @@ async fn fall_through_proxy(
 /// Handles authenticated EchoMesh client session over the Noise protocol.
 async fn handle_authenticated_noise_session<S>(
     stream: &mut S,
+    server_private_key: &[u8],
+    peer_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let session = server_noise_handshake(stream).await?;
+    let session = server_noise_handshake(stream, server_private_key, Some(peer_addr)).await?;
     let mut framed = NoiseFramedStream::new(stream, session);
+    debug!(%peer_addr, "Noise framed stream ready for frame exchange");
 
     // Relay processing loop: process or echo valid frames
     while let Some(frame) = framed.recv_frame().await? {
-        // Echo frame back or forward through stateless relay
+        debug!(%peer_addr, payload_len = frame.payload.len(), "received frame from client; echoing");
         let response = Frame::new(frame.session_id, frame.nonce, frame.payload)?;
         framed.send_frame(&response).await?;
     }
 
+    debug!(%peer_addr, "Noise session ended normally");
     Ok(())
 }

@@ -49,6 +49,7 @@ async fn test_authenticated_client_with_secret_token_connects_and_exchanges_fram
 
     let relay_listener = RelayListener::bind(listener_config).await.unwrap();
     let relay_addr = relay_listener.local_addr().unwrap();
+    let server_pub = relay_listener.secrets().public_key.clone();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_task = tokio::spawn(async move {
@@ -65,7 +66,7 @@ async fn test_authenticated_client_with_secret_token_connects_and_exchanges_fram
     client_stream.flush().await.unwrap();
 
     // 3. Client initiates Noise handshake over the same socket
-    let noise_session = client_noise_handshake(&mut client_stream).await.unwrap();
+    let noise_session = client_noise_handshake(&mut client_stream, &server_pub).await.unwrap();
     let mut framed_stream = NoiseFramedStream::new(client_stream, noise_session);
 
     // 4. Send 1420-byte EchoMesh binary frame
