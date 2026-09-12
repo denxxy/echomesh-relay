@@ -12,8 +12,8 @@ use crate::protocol::frame::{Frame, SessionId};
 pub type RouteId = SessionId;
 
 pub const ROUTER_CONTROL_ID: RouteId = [0xEC; 16];
-pub const ROUTE_REGISTER_MAGIC: &[u8; 4] = b"EMR1";
-pub const ROUTE_REGISTERED_MAGIC: &[u8; 4] = b"EMA1";
+pub const ROUTE_REGISTER_MAGIC: &[u8; 4] = b"EMR2";
+pub const ROUTE_REGISTERED_MAGIC: &[u8; 4] = b"EMA2";
 pub const ROUTE_REGISTRATION_CONTEXT: &[u8] = b"EchoMesh route registration v2";
 const ROUTE_REGISTRATION_LEN: usize = 4 + 16 + 32 + 64;
 
@@ -81,7 +81,7 @@ pub fn registration_ack_frame(route_id: RouteId) -> Frame {
 
 /// Validates proof-of-possession for the Ed25519 identity that owns a route.
 /// A token-authenticated relay client cannot claim another peer's route without
-/// that peer's signing key. Legacy 20-byte EMR1 registrations are rejected.
+/// that peer's signing key. Legacy unsigned registrations are rejected.
 pub fn parse_registration(frame: &Frame) -> Option<RouteId> {
     if frame.session_id != ROUTER_CONTROL_ID
         || frame.payload.len() != ROUTE_REGISTRATION_LEN
@@ -138,6 +138,7 @@ mod tests {
     fn signed_registration_round_trip() {
         let frame = signed_registration([0x42; 32]);
         assert!(parse_registration(&frame).is_some());
+        assert_eq!(&frame.payload[..4], b"EMR2");
     }
 
     #[test]
@@ -152,7 +153,7 @@ mod tests {
     #[test]
     fn legacy_unsigned_registration_is_rejected() {
         let mut payload = Vec::new();
-        payload.extend_from_slice(ROUTE_REGISTER_MAGIC);
+        payload.extend_from_slice(b"EMR1");
         payload.extend_from_slice(&[0x42; 16]);
         let frame = Frame::new(ROUTER_CONTROL_ID, [0u8; 8], Bytes::from(payload)).unwrap();
         assert_eq!(parse_registration(&frame), None);
