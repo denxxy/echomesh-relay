@@ -1,9 +1,14 @@
 use bytes::Bytes;
+use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use echomesh_relay::protocol::Frame;
-use echomesh_relay::server::router::{registration_frame, ROUTER_CONTROL_ID};
+use echomesh_relay::server::router::{
+    ROUTER_CONTROL_ID, ROUTE_REGISTERED_MAGIC, ROUTE_REGISTER_MAGIC,
+    ROUTE_REGISTRATION_CONTEXT,
+};
 use echomesh_relay::server::{ListenerConfig, RelayListener};
 use echomesh_relay::transport::{client_noise_handshake, NoiseFramedStream};
 
@@ -21,10 +26,8 @@ async fn routes_between_two_registered_noise_clients() {
         relay.run_with_shutdown(shutdown_rx).await.unwrap();
     });
 
-    let route_a = [0xA1; 16];
-    let route_b = [0xB2; 16];
-    let mut alice = connect_and_register(address, &server_public_key, route_a).await;
-    let mut bob = connect_and_register(address, &server_public_key, route_b).await;
+    let (mut alice, route_a) = connect_and_register(address, &server_public_key, [0xA1; 32]).await;
+    let (mut bob, route_b) = connect_and_register(address, &server_public_key, [0xB2; 32]).await;
 
     let outgoing = Frame::new(route_a, [9u8; 8], Bytes::from_static(b"opaque-client-e2ee")).unwrap();
     bob.send_frame(&outgoing).await.unwrap();
@@ -45,15 +48,34 @@ async fn routes_between_two_registered_noise_clients() {
 async fn connect_and_register(
     address: std::net::SocketAddr,
     server_public_key: &[u8],
-    route: [u8; 16],
-) -> NoiseFramedStream<TcpStream> {
+    seed: [u8; 32],
+) -> (NoiseFramedStream<TcpStream>, [u8; 16]) {
+    let signing = SigningKey::from_bytes(&seed);
+    let peer_id = signing.verifying_key().to_bytes();
+    let digest = Sha256::digest(peer_id);
+    let mut route = [0u8; 16];
+    route.copy_from_slice(&digest[..16]);
+
+    let mut signed = Vec::with_capacity(ROUTE_REGISTRATION_CONTEXT.len() + 48);
+    signed.extend_from_slice(ROUTE_REGISTRATION_CONTEXT);
+    signed.extend_from_slice(&route);
+    signed.extend_from_slice(&peer_id);
+    let signature = signing.sign(&signed);
+
+    let mut payload = Vec::with_capacity(116);
+    payload.extend_from_slice(ROUTE_REGISTER_MAGIC);
+    payload.extend_from_slice(&route);
+    payload.extend_from_slice(&peer_id);
+    payload.extend_from_slice(&signature.to_bytes());
+    let registration = Frame::new(ROUTER_CONTROL_ID, [0u8; 8], Bytes::from(payload)).unwrap();
+
     let mut stream = TcpStream::connect(address).await.unwrap();
     let noise = client_noise_handshake(&mut stream, server_public_key).await.unwrap();
     let mut framed = NoiseFramedStream::new(stream, noise);
-    framed.send_frame(&registration_frame(route)).await.unwrap();
+    framed.send_frame(&registration).await.unwrap();
     let ack = framed.recv_frame().await.unwrap().unwrap();
     assert_eq!(ack.session_id, ROUTER_CONTROL_ID);
-    assert_eq!(&ack.payload[..4], b"EMA1");
+    assert_eq!(&ack.payload[..4], ROUTE_REGISTERED_MAGIC);
     assert_eq!(&ack.payload[4..], &route);
-    framed
+    (framed, route)
 }
