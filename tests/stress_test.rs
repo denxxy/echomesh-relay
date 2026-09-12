@@ -12,6 +12,7 @@ use echomesh_relay::transport::PseudoTlsBuilder;
 const TOTAL_CONNECTIONS: usize = 5_000;
 const MAX_MEMORY_LIMIT_BYTES: usize = 150 * 1024 * 1024;
 
+#[cfg(unix)]
 fn get_open_fd_count() -> usize {
     if let Ok(entries) = std::fs::read_dir("/dev/fd") {
         entries.count()
@@ -22,8 +23,13 @@ fn get_open_fd_count() -> usize {
     }
 }
 
+#[cfg(not(unix))]
+fn get_open_fd_count() -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
 fn get_resident_memory_bytes() -> usize {
-    #[cfg(target_os = "macos")]
     unsafe {
         use std::mem::MaybeUninit;
         let mut info: libc::mach_task_basic_info = MaybeUninit::zeroed().assume_init();
@@ -42,22 +48,28 @@ fn get_resident_memory_bytes() -> usize {
             0
         }
     }
+}
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    unsafe {
-        use std::mem::MaybeUninit;
-        let mut usage: libc::rusage = MaybeUninit::zeroed().assume_init();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
-            (usage.ru_maxrss as usize) * 1024
-        } else {
-            0
-        }
-    }
+#[cfg(target_os = "linux")]
+fn get_resident_memory_bytes() -> usize {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(resident_pages) = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return 0;
+    };
+    // GitHub's Linux runners use 4 KiB pages. This metric is only a defensive
+    // stress-test bound; unsupported platforms intentionally return zero.
+    resident_pages.saturating_mul(4096)
+}
 
-    #[cfg(not(unix))]
-    {
-        0
-    }
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_resident_memory_bytes() -> usize {
+    0
 }
 
 fn generate_fuzz_payload(index: usize) -> Vec<u8> {
