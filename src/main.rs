@@ -18,10 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Secret material is never part of normal status/diagnostic output. Operators
-    // who explicitly need the token for provisioning must opt in to this single-
-    // purpose command; it writes only the token to stdout before tracing/network
-    // initialization so it cannot be duplicated into logs.
     if args.iter().any(|arg| arg == "--show-secret-token") {
         let key_file = resolve_key_file_path(&args);
         let dummy_bind: SocketAddr = "0.0.0.0:8443".parse().unwrap();
@@ -44,17 +40,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dummy_bind,
             resolve_secret_token(&args),
         )?;
-        if args.iter().any(|arg| arg == "--json") {
-            println!(
-                r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"[REDACTED]","key_file":"{}"}}"#,
-                secrets.url,
-                secrets.public_key_hex,
-                secrets.public_key_base64,
-                key_file.display()
-            );
-        } else {
-            println!("{}", secrets);
-        }
+        println!(
+            r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"[REDACTED]","key_file":"{}"}}"#,
+            secrets.url,
+            secrets.public_key_hex,
+            secrets.public_key_base64,
+            key_file.display()
+        );
         return Ok(());
     }
 
