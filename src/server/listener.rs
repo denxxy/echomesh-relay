@@ -788,7 +788,7 @@ async fn handle_connection(
         };
 
         // Direct Noise handshake: 2-byte big-endian message length (NK message 1 is 48 bytes)
-        if msg_len >= 32 && msg_len <= 128 {
+        if (32..=128).contains(&msg_len) {
             debug!(%peer_addr, msg_len, "detected direct Noise handshake message, initiating session");
             let mut stream = PrefixedStream::new(initial_buf, client_stream);
             if let Err(err) = handle_authenticated_noise_session(&mut stream, &config.secrets.private_key, peer_addr).await {
