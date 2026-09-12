@@ -170,16 +170,12 @@ impl RelaySecrets {
     ) -> Result<Self, crate::crypto::KeyError> {
         let keypair = crate::crypto::load_or_generate_keypair(key_path)?;
 
-        let token = match read_saved_token(key_path) {
-            Some(saved) => saved,
-            None => {
-                let initial = match secret_token {
-                    Some(s) if !s.is_empty() => s,
-                    _ => DEFAULT_SECRET_TOKEN.to_vec(),
-                };
-                let _ = save_token_files(key_path, &initial, &keypair.public_key_base64);
-                initial
-            }
+        let token = if let Some(s) = secret_token.filter(|s| !s.is_empty()) {
+            s
+        } else if let Some(saved) = read_saved_token(key_path) {
+            saved
+        } else {
+            DEFAULT_SECRET_TOKEN.to_vec()
         };
 
         // Persist token to disk so it does not change across daemon restarts
@@ -687,24 +683,34 @@ async fn handle_connection(
     if initial_buf[0] == crate::transport::obfuscation::TLS_HANDSHAKE_CONTENT_TYPE {
         debug!(%peer_addr, "detected TLS record header (0x16), parsing ClientHello");
         let mut consumed_len = 0;
+        let validate_client = |parsed: &crate::transport::obfuscation::ParsedClientHello| -> bool {
+            let is_dev_mode = validator.is_insecure_no_token()
+                || std::env::var("ECHOMESH_INSECURE_NO_AUTH")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            let valid = if is_dev_mode {
+                tracing::warn!("DEVELOPER MODE: Token validation bypassed for {}", peer_addr);
+                true
+            } else {
+                validator.validate(parsed)
+            };
+            if !valid {
+                let random_prefix = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
+                tracing::warn!(
+                    "Auth failed from {}. Client random prefix: {}. Routing to fallback.",
+                    peer_addr, random_prefix
+                );
+            }
+            valid
+        };
+
         let is_authenticated = match parse_client_hello(&initial_buf) {
             ClientHelloStatus::Complete(parsed) => {
                 if initial_buf.len() >= 5 {
                     let rec_len = u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
                     consumed_len = 5 + rec_len;
                 }
-                let client_random_hex = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
-                tracing::info!(
-                    "Validating ClientHello from {}. Client random prefix: {}, SNI: {:?}",
-                    peer_addr, client_random_hex, parsed.sni
-                );
-                let valid = validator.validate(&parsed);
-                if !valid {
-                    tracing::warn!(
-                        "ClientHello validation failed for {}. Expected token mismatch. Routing to fallback.",
-                        peer_addr
-                    );
-                }
+                let valid = validate_client(&parsed);
                 debug!(
                     %peer_addr,
                     is_valid = valid,
@@ -736,18 +742,7 @@ async fn handle_connection(
                                     u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
                                 consumed_len = 5 + rec_len;
                             }
-                            let client_random_hex = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
-                            tracing::info!(
-                                "Validating ClientHello from {}. Client random prefix: {}, SNI: {:?}",
-                                peer_addr, client_random_hex, parsed.sni
-                            );
-                            let valid = validator.validate(&parsed);
-                            if !valid {
-                                tracing::warn!(
-                                    "ClientHello validation failed for {}. Expected token mismatch. Routing to fallback.",
-                                    peer_addr
-                                );
-                            }
+                            let valid = validate_client(&parsed);
                             debug!(%peer_addr, is_valid = valid, "ClientHello parsed after reading full record");
                             valid
                         } else {

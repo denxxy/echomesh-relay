@@ -313,6 +313,11 @@ impl TokenValidator {
         self.with_insecure_no_token(enabled)
     }
 
+    /// Returns whether insecure token bypass is enabled.
+    pub fn is_insecure_no_token(&self) -> bool {
+        self.insecure_no_token
+    }
+
     /// Validates whether the `ParsedClientHello` contains the valid pre-shared secret token
     /// in `ClientHello.random` or in the `SNI` field.
     ///
@@ -398,10 +403,15 @@ impl PseudoTlsBuilder {
     /// Builds the complete binary TLS 1.3 ClientHello record ready for transmission over TCP.
     pub fn build(&self) -> Vec<u8> {
         let mut random = [0x5au8; 32];
-        // Embed token in random if token_in_sni is false or token length <= 32
-        if !self.token_in_sni && !self.secret_token.is_empty() {
-            let copy_len = self.secret_token.len().min(32);
-            random[..copy_len].copy_from_slice(&self.secret_token[..copy_len]);
+        let secret_token = if self.secret_token.is_empty() {
+            DEFAULT_SECRET_TOKEN
+        } else {
+            &self.secret_token[..]
+        };
+        // Embed token in random if token_in_sni is false
+        if !self.token_in_sni {
+            let copy_len = secret_token.len().min(32);
+            random[..copy_len].copy_from_slice(&secret_token[..copy_len]);
         }
 
         let sni_string = if self.token_in_sni {

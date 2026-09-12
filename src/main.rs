@@ -28,10 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|arg| arg == "--show-credentials") {
         let key_file = resolve_key_file_path(&args);
         let dummy_bind: SocketAddr = "0.0.0.0:8443".parse().unwrap();
-        let secret_token_opt = std::env::var("ECHOMESH_SECRET")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.into_bytes());
+        let secret_token_opt = resolve_secret_token(&args);
         let secrets = RelaySecrets::load_or_generate(&key_file, dummy_bind, secret_token_opt)?;
         println!(
             "{{\n  \"public_key_base64\": \"{}\",\n  \"secret_token_hex\": \"{}\"\n}}",
@@ -65,10 +62,7 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         e
     })?;
 
-    let secret_token_opt = std::env::var("ECHOMESH_SECRET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.into_bytes());
+    let secret_token_opt = resolve_secret_token(&args);
 
     let fallback_target = std::env::var("ECHOMESH_FALLBACK_TARGET")
         .unwrap_or_else(|_| "cloudflare.com:443".to_string());
@@ -205,3 +199,28 @@ Secret Token (Hex): {}\n\
 
     Ok(())
 }
+
+fn resolve_secret_token(args: &[String]) -> Option<Vec<u8>> {
+    args.windows(2)
+        .find_map(|w| {
+            if w[0] == "--secret" || w[0] == "--secret-token" {
+                Some(w[1].clone().into_bytes())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            args.iter().find_map(|a| {
+                a.strip_prefix("--secret=")
+                    .or_else(|| a.strip_prefix("--secret-token="))
+                    .map(|s| s.as_bytes().to_vec())
+            })
+        })
+        .or_else(|| {
+            std::env::var("ECHOMESH_SECRET")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.into_bytes())
+        })
+}
+
