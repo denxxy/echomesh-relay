@@ -11,6 +11,10 @@ use echomesh_relay::crypto::{
 };
 use echomesh_relay::server::{ListenerConfig, RelayListener, RelaySecrets};
 
+const LEGACY_SHARED_TOKEN: &[u8] = b"echomesh_secret_mesh_token_2026";
+const LEGACY_SHARED_TOKEN_HEX: &str =
+    "6563686f6d6573685f7365637265745f6d6573685f746f6b656e5f32303236";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -139,17 +143,49 @@ fn resolve_or_generate_secret_token(
         return Ok(Some(explicit));
     }
 
-    // Existing deployments keep their persisted token. `load_or_generate`
-    // parses these files and fails closed if they are corrupt or empty.
-    if derive_token_path(key_file).exists() || derive_relay_json_path(key_file).exists() {
+    let token_path = derive_token_path(key_file);
+    let json_path = derive_relay_json_path(key_file);
+    let persisted = std::fs::read(&token_path).ok();
+    let persisted_json = std::fs::read_to_string(&json_path).ok();
+    let legacy_persisted = persisted
+        .as_deref()
+        .map(is_legacy_token_file)
+        .unwrap_or(false)
+        || persisted_json
+            .as_deref()
+            .map(|text| text.contains(LEGACY_SHARED_TOKEN_HEX))
+            .unwrap_or(false);
+
+    // Rotate the old repository-wide token instead of silently preserving a
+    // credential that is already public. Passing the new token explicitly to
+    // `load_or_generate` causes both relay.token and relay.json to be replaced.
+    if legacy_persisted {
+        return Ok(Some(generate_secret_token()?));
+    }
+
+    // Existing non-legacy deployments keep their unique persisted token.
+    if token_path.exists() || json_path.exists() {
         return Ok(None);
     }
 
     // First provisioning gets a unique cryptographically random 32-byte token.
-    // Reuse Snow's CSPRNG-backed key generator so no static credential is ever
-    // compiled into the binary or repository.
+    Ok(Some(generate_secret_token()?))
+}
+
+fn is_legacy_token_file(raw: &[u8]) -> bool {
+    if raw == LEGACY_SHARED_TOKEN {
+        return true;
+    }
+    let text = String::from_utf8_lossy(raw);
+    let trimmed = text.trim();
+    trimmed.as_bytes() == LEGACY_SHARED_TOKEN || trimmed.eq_ignore_ascii_case(LEGACY_SHARED_TOKEN_HEX)
+}
+
+fn generate_secret_token() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Snow uses the platform CSPRNG for key generation. We only need the
+    // resulting 32 random bytes as a bearer token and discard the keypair.
     let builder = snow::Builder::new(echomesh_relay::transport::noise::NOISE_PATTERN.parse()?);
-    Ok(Some(builder.generate_keypair()?.public))
+    Ok(builder.generate_keypair()?.public)
 }
 
 fn resolve_secret_token(args: &[String]) -> Option<Vec<u8>> {
