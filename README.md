@@ -30,3 +30,17 @@ cargo clippy -- -D warnings
 # Build release binary (LTO enabled, single codegen unit)
 cargo build --release
 ```
+
+---
+
+## Documentation in Russian
+
+- [Инструкция по установке, развертыванию и настройке на русском языке (INSTALL_RU.md)](INSTALL_RU.md)
+
+---
+
+## Related Projects
+
+- [echomesh-windows](https://github.com/denxxy/echomesh-windows) — Native Windows client (Tauri v2 + Fluent UI + echomesh-core).
+- [echomesh-mac](https://github.com/denxxy/echomesh-mac) — Native macOS client (SwiftUI + UniFFI + echomesh-core).
+
