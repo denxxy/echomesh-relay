@@ -100,6 +100,19 @@ impl NoiseSession {
     }
 }
 
+/// Formats a `snow::Error` into its exact enum variant name for diagnostics.
+pub fn snow_error_enum(err: &snow::Error) -> String {
+    match err {
+        snow::Error::Pattern(p) => format!("Pattern({:?})", p),
+        snow::Error::Init(i) => format!("Init({:?})", i),
+        snow::Error::Prereq(p) => format!("Prereq({:?})", p),
+        snow::Error::State(s) => format!("State({:?})", s),
+        snow::Error::Input => "Input".to_string(),
+        snow::Error::Decrypt => "Decrypt".to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
 /// Helper to execute the server-side Noise handshake over an async stream.
 pub async fn server_noise_handshake<S>(
     stream: &mut S,
@@ -117,34 +130,72 @@ where
     if !NOISE_PROLOGUE.is_empty() {
         builder = builder.prologue(NOISE_PROLOGUE)?;
     }
-    let mut responder = builder
-        .local_private_key(server_private_key)?
-        .build_responder()?;
-
-    tracing::debug!(?peer_addr, "Noise responder initialized (pattern: {}), waiting for message 1", NOISE_PATTERN);
-
-    // 1. Read message 1 length and payload from client (-> e, es)
-    let msg1_len = match stream.read_u16().await {
-        Ok(len) => len as usize,
+    let mut responder = match builder
+        .local_private_key(server_private_key)
+        .and_then(|b| b.build_responder())
+    {
+        Ok(r) => r,
         Err(e) => {
-            tracing::error!(?peer_addr, error = ?e, "Failed reading Noise message 1 length from stream");
-            return Err(NoiseError::Io(e));
+            let err_enum = snow_error_enum(&e);
+            tracing::error!(
+                ?peer_addr,
+                error = ?e,
+                snow_error = %err_enum,
+                "Failed building Noise responder with snow::Error enum: {}",
+                err_enum
+            );
+            return Err(NoiseError::Snow(e));
         }
     };
 
-    let mut msg1 = vec![0u8; msg1_len];
-    if let Err(e) = stream.read_exact(&mut msg1).await {
-        tracing::error!(?peer_addr, error = ?e, msg1_len, "Failed reading Noise message 1 payload from stream");
-        return Err(NoiseError::Io(e));
-    }
+    tracing::debug!(?peer_addr, "Noise responder initialized (pattern: {}), waiting for message 1", NOISE_PATTERN);
+
+    let handshake_timeout = std::time::Duration::from_secs(5);
+
+    // 1. Read message 1 length and payload from client (-> e, es) with 5s timeout
+    let read_res = tokio::time::timeout(handshake_timeout, async {
+        let msg1_len = stream.read_u16().await.map_err(NoiseError::Io)? as usize;
+        let mut msg1 = vec![0u8; msg1_len];
+        stream.read_exact(&mut msg1).await.map_err(NoiseError::Io)?;
+        Ok::<_, NoiseError>((msg1_len, msg1))
+    })
+    .await;
+
+    let (msg1_len, msg1) = match read_res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::error!(?peer_addr, error = ?e, "Failed reading Noise message 1 from stream");
+            return Err(e);
+        }
+        Err(_) => {
+            tracing::warn!(?peer_addr, "Handshake timed out waiting for relay response");
+            return Err(NoiseError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Handshake timed out waiting for relay response",
+            )));
+        }
+    };
+
+    let hex_prefix = crate::transport::obfuscation::hex_encode(&msg1[..msg1.len().min(16)]);
+    tracing::info!(
+        ?peer_addr,
+        bytes_len = msg1.len(),
+        hex_prefix = %hex_prefix,
+        "Noise message 1 received: bytes.len()={}, hex_prefix={}",
+        msg1.len(),
+        hex_prefix
+    );
 
     let mut dummy_payload = [0u8; 128];
     if let Err(e) = responder.read_message(&msg1, &mut dummy_payload) {
+        let err_enum = snow_error_enum(&e);
         tracing::error!(
             ?peer_addr,
             error = ?e,
+            snow_error = %err_enum,
             msg1_len,
-            "Noise responder.read_message() failed on message 1"
+            "Noise responder.read_message() failed on message 1 with snow::Error enum: {}",
+            err_enum
         );
         return Err(NoiseError::Snow(e));
     }
@@ -155,7 +206,14 @@ where
     let n2 = match responder.write_message(&[], &mut msg2) {
         Ok(n) => n,
         Err(e) => {
-            tracing::error!(?peer_addr, error = ?e, "Noise responder.write_message() failed on message 2");
+            let err_enum = snow_error_enum(&e);
+            tracing::error!(
+                ?peer_addr,
+                error = ?e,
+                snow_error = %err_enum,
+                "Noise responder.write_message() failed on message 2 with snow::Error enum: {}",
+                err_enum
+            );
             return Err(NoiseError::Snow(e));
         }
     };

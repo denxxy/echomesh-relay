@@ -23,6 +23,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Early exit for --show-credentials:
+    // Strictly evaluated before network runtime initialization or socket binding to avoid AddrInUse
+    if args.iter().any(|arg| arg == "--show-credentials") {
+        let key_file = resolve_key_file_path(&args);
+        let dummy_bind: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        let secret_token_opt = std::env::var("ECHOMESH_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.into_bytes());
+        let secrets = RelaySecrets::load_or_generate(&key_file, dummy_bind, secret_token_opt)?;
+        println!(
+            "{{\n  \"public_key_base64\": \"{}\",\n  \"secret_token_hex\": \"{}\"\n}}",
+            secrets.public_key_base64,
+            secrets.secret_token_hex
+        );
+        return Ok(());
+    }
+
     // Initialize tokio async runtime only for daemon execution
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -60,6 +78,15 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096);
 
+    let insecure_no_token = args.iter().any(|arg| arg == "--insecure-no-token" || arg == "--dev-mode")
+        || std::env::var("ECHOMESH_INSECURE_NO_TOKEN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+    if insecure_no_token {
+        tracing::warn!("INSECURE MODE ACTIVE: Pseudo-TLS secret token validation is disabled.");
+    }
+
     let secrets = RelaySecrets::load_or_generate(&key_file, bind_addr, secret_token_opt)?;
 
     // Handle CLI inspection flags: --secrets or --show-secrets or --json
@@ -84,25 +111,26 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let config = ListenerConfig::new_with_secrets(bind_addr, secrets.clone())
         .with_fallback_target(fallback_target)
         .with_max_connections(max_connections)
-        .with_handshake_timeout(Duration::from_secs(5));
+        .with_handshake_timeout(Duration::from_secs(5))
+        .with_insecure_no_token(insecure_no_token);
 
     let listener = RelayListener::bind(config).await?;
 
     let startup_banner = format!(
-        "======================================================\n\
-EchoMesh Relay started\n\
-Bind Address: {}\n\
-Server Noise Public Key (Base64): {}\n\
-Key file: {}\n\
-======================================================",
+        "=====================================================\n\
+EchoMesh Relay Active\n\
+Bind: {}\n\
+Noise Public Key: {}\n\
+Secret Token (Hex): {}\n\
+=====================================================",
         bind_addr,
         secrets.public_key_base64,
-        key_file.display()
+        secrets.secret_token_hex
     );
 
-    // Guaranteed banner output to both tracing and stderr
+    // Guaranteed banner output to stdout and tracing
+    println!("{}", startup_banner);
     info!("{}", startup_banner);
-    eprintln!("{}", startup_banner);
 
     // Return secrets prominently on startup to stdout
     if wants_json {

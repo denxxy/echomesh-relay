@@ -192,6 +192,8 @@ fn test_relay_secrets_load_or_generate_preserves_keys() {
     assert_eq!(secrets1.public_key_hex, secrets2.public_key_hex);
     assert_eq!(secrets1.public_key_base64, secrets2.public_key_base64);
     assert_eq!(secrets1.private_key, secrets2.private_key);
+    assert_eq!(secrets1.secret_token, secrets2.secret_token);
+    assert_eq!(secrets1.secret_token_hex, secrets2.secret_token_hex);
 }
 
 #[test]
@@ -250,4 +252,60 @@ fn test_show_public_key_works_when_port_is_already_bound() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), keypair.public_key_base64);
 }
+
+#[test]
+fn test_show_credentials_cli_flag() {
+    let temp_dir = TempDirGuard::new("cli_creds");
+    let key_path = temp_dir.path().join("relay.key");
+
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "--",
+            "--show-credentials",
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("execute cargo run with --show-credentials");
+
+    assert!(output.status.success(), "Process failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"public_key_base64\":"));
+    assert!(stdout.contains("\"secret_token_hex\":"));
+}
+
+#[test]
+fn test_show_credentials_works_when_port_is_already_bound() {
+    let temp_dir = TempDirGuard::new("creds_port_bound");
+    let key_path = temp_dir.path().join("relay.key");
+
+    let occupied_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind occupied port");
+    let occupied_addr = occupied_listener.local_addr().expect("local addr");
+
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "--",
+            "--show-credentials",
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .env("ECHOMESH_BIND_ADDR", occupied_addr.to_string())
+        .output()
+        .expect("run show-credentials with occupied bind addr");
+
+    assert!(
+        output.status.success(),
+        "Command failed when port was occupied: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"public_key_base64\":"));
+    assert!(stdout.contains("\"secret_token_hex\":"));
+}
+
 

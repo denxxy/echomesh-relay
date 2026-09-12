@@ -270,6 +270,7 @@ pub fn parse_client_hello(src: &[u8]) -> ClientHelloStatus {
 pub struct TokenValidator {
     secret: Vec<u8>,
     expected_sni: Option<String>,
+    insecure_no_token: bool,
 }
 
 impl fmt::Debug for TokenValidator {
@@ -278,6 +279,7 @@ impl fmt::Debug for TokenValidator {
         f.debug_struct("TokenValidator")
             .field("secret", &"[REDACTED]")
             .field("expected_sni", &self.expected_sni)
+            .field("insecure_no_token", &self.insecure_no_token)
             .finish()
     }
 }
@@ -288,6 +290,7 @@ impl TokenValidator {
         Self {
             secret: secret.into(),
             expected_sni: None,
+            insecure_no_token: false,
         }
     }
 
@@ -297,11 +300,21 @@ impl TokenValidator {
         self
     }
 
+    /// Enables or disables insecure bypass of token validation (dev/debug mode).
+    pub fn with_insecure_no_token(mut self, enabled: bool) -> Self {
+        self.insecure_no_token = enabled;
+        self
+    }
+
     /// Validates whether the `ParsedClientHello` contains the valid pre-shared secret token
     /// in `ClientHello.random` or in the `SNI` field.
     ///
     /// Checks are executed using constant-time comparison to prevent timing side-channel attacks.
     pub fn validate(&self, client_hello: &ParsedClientHello) -> bool {
+        if self.insecure_no_token {
+            return true;
+        }
+
         if self.secret.is_empty() {
             return false;
         }
@@ -590,5 +603,21 @@ mod tests {
                 expected_record_len: 5 + 0x50
             }
         );
+    }
+
+    #[test]
+    fn test_insecure_no_token_bypass() {
+        let builder = PseudoTlsBuilder::new(b"attacker_invalid_secret".to_vec(), "cloudflare.com");
+        let bytes = builder.build();
+        let status = parse_client_hello(&bytes);
+        if let ClientHelloStatus::Complete(parsed) = status {
+            let strict_validator = TokenValidator::new(b"expected_server_token".to_vec());
+            assert!(!strict_validator.validate(&parsed));
+
+            let bypass_validator = strict_validator.with_insecure_no_token(true);
+            assert!(bypass_validator.validate(&parsed));
+        } else {
+            panic!("expected Complete parsed client hello");
+        }
     }
 }

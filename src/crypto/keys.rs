@@ -191,6 +191,34 @@ pub fn derive_pubkey_path(key_path: &Path) -> PathBuf {
     }
 }
 
+/// Derives the companion secret token path (`relay.token`) for a given key path.
+pub fn derive_token_path(key_path: &Path) -> PathBuf {
+    let stem_token = key_path.with_extension("token");
+    if stem_token != key_path {
+        return stem_token;
+    }
+    let parent = key_path.parent().unwrap_or_else(|| Path::new(""));
+    if parent.as_os_str().is_empty() {
+        PathBuf::from("relay.token")
+    } else {
+        parent.join("relay.token")
+    }
+}
+
+/// Derives the companion JSON configuration path (`relay.json`) for a given key path.
+pub fn derive_relay_json_path(key_path: &Path) -> PathBuf {
+    let stem_json = key_path.with_extension("json");
+    if stem_json != key_path {
+        return stem_json;
+    }
+    let parent = key_path.parent().unwrap_or_else(|| Path::new(""));
+    if parent.as_os_str().is_empty() {
+        PathBuf::from("relay.json")
+    } else {
+        parent.join("relay.json")
+    }
+}
+
 /// Parses 32-byte private key bytes from raw file data, supporting raw binary,
 /// 64-character hex, or 44-character Base64 formats.
 fn parse_private_key_bytes(raw: &[u8]) -> Result<Vec<u8>, KeyError> {

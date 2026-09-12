@@ -13,7 +13,8 @@ use tracing::{debug, info, warn};
 use crate::protocol::frame::Frame;
 use crate::transport::noise::{server_noise_handshake, NoiseFramedStream, NOISE_PATTERN};
 use crate::transport::obfuscation::{
-    hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator, MAX_CLIENT_HELLO_SIZE,
+    hex_decode, hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator,
+    MAX_CLIENT_HELLO_SIZE,
 };
 
 /// Cryptographic secrets and connection identifiers for an EchoMesh Relay instance.
@@ -158,14 +159,171 @@ impl RelaySecrets {
     }
 
     /// Loads an existing key or generates a persistent key at `key_path` and creates `RelaySecrets`.
+    /// Also loads or generates and persists the secret token to companion `relay.token` / `relay.json`.
     pub fn load_or_generate(
         key_path: &std::path::Path,
         bind_addr: SocketAddr,
         secret_token: Option<Vec<u8>>,
     ) -> Result<Self, crate::crypto::KeyError> {
         let keypair = crate::crypto::load_or_generate_keypair(key_path)?;
-        Ok(Self::from_keypair(bind_addr, keypair, secret_token)?)
+
+        let token = match secret_token {
+            Some(s) if !s.is_empty() => s,
+            _ => match read_saved_token(key_path) {
+                Some(saved) => saved,
+                None => {
+                    let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
+                    let token_pair = builder.generate_keypair()?;
+                    token_pair.public
+                }
+            },
+        };
+
+        // Persist token to disk so it does not change across daemon restarts
+        let _ = save_token_files(key_path, &token, &keypair.public_key_base64);
+
+        let secret_token_hex = hex_encode(&token);
+        let public_key_hex = hex_encode(&keypair.public_key);
+        let private_key_hex = hex_encode(&keypair.private_key);
+        let url = format!("https://{}", bind_addr);
+
+        Ok(Self {
+            secret_token: token,
+            secret_token_hex,
+            public_key: keypair.public_key,
+            public_key_hex,
+            public_key_base64: keypair.public_key_base64,
+            private_key: keypair.private_key,
+            private_key_hex,
+            url,
+            key_file: Some(keypair.key_path),
+        })
     }
+}
+
+fn read_saved_token(key_path: &std::path::Path) -> Option<Vec<u8>> {
+    let json_path = crate::crypto::derive_relay_json_path(key_path);
+    if json_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&json_path) {
+            if let Some(token) = parse_token_from_json(&content) {
+                return Some(token);
+            }
+        }
+    }
+
+    let token_path = crate::crypto::derive_token_path(key_path);
+    if token_path.exists() {
+        if let Ok(raw) = std::fs::read(&token_path) {
+            if let Some(token) = parse_token_bytes(&raw) {
+                return Some(token);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_token_from_json(json_str: &str) -> Option<Vec<u8>> {
+    for key in &["\"secret_token_hex\":", "\"secret_token\":"] {
+        if let Some(pos) = json_str.find(key) {
+            let rest = &json_str[pos + key.len()..];
+            if let Some(start_quote) = rest.find('"') {
+                let after_quote = &rest[start_quote + 1..];
+                if let Some(end_quote) = after_quote.find('"') {
+                    let val = after_quote[..end_quote].trim();
+                    if val.len() == 64 {
+                        if let Some(bytes) = hex_decode(val) {
+                            return Some(bytes);
+                        }
+                    }
+                    if !val.is_empty() {
+                        if let Some(bytes) = hex_decode(val) {
+                            return Some(bytes);
+                        }
+                        return Some(val.as_bytes().to_vec());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_token_bytes(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() == 32 {
+        return Some(raw.to_vec());
+    }
+    let text = String::from_utf8_lossy(raw).trim().to_string();
+    if text.len() == 64 {
+        if let Some(bytes) = hex_decode(&text) {
+            return Some(bytes);
+        }
+    }
+    if !text.is_empty() {
+        if let Some(bytes) = hex_decode(&text) {
+            return Some(bytes);
+        }
+        return Some(text.into_bytes());
+    }
+    None
+}
+
+fn save_token_files(
+    key_path: &std::path::Path,
+    secret_token: &[u8],
+    public_key_base64: &str,
+) -> Result<(), std::io::Error> {
+    let token_hex = hex_encode(secret_token);
+    let token_path = crate::crypto::derive_token_path(key_path);
+    let json_path = crate::crypto::derive_relay_json_path(key_path);
+
+    write_secure_file(&token_path, format!("{}\n", token_hex).as_bytes())?;
+
+    let json_content = format!(
+        "{{\n  \"public_key_base64\": \"{}\",\n  \"secret_token_hex\": \"{}\"\n}}\n",
+        public_key_base64, token_hex
+    );
+    write_secure_file(&json_path, json_content.as_bytes())?;
+
+    Ok(())
+}
+
+fn write_secure_file(path: &std::path::Path, data: &[u8]) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(data)?;
+        file.flush()?;
+
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(data)?;
+        file.flush()?;
+    }
+
+    Ok(())
 }
 
 /// An asynchronous stream adapter that yields a prefixed buffer of bytes
@@ -258,6 +416,9 @@ pub struct ListenerConfig {
 
     /// Cryptographic secrets bundle for relay authentication and client connection.
     pub secrets: RelaySecrets,
+
+    /// Insecure bypass flag for dev/debugging without token authentication.
+    pub insecure_no_token: bool,
 }
 
 impl ListenerConfig {
@@ -281,6 +442,7 @@ impl ListenerConfig {
             secret_token: token_bytes,
             handshake_timeout: Duration::from_secs(5),
             secrets,
+            insecure_no_token: false,
         }
     }
 
@@ -293,6 +455,7 @@ impl ListenerConfig {
             secret_token: secrets.secret_token.clone(),
             handshake_timeout: Duration::from_secs(5),
             secrets,
+            insecure_no_token: false,
         }
     }
 
@@ -320,6 +483,12 @@ impl ListenerConfig {
         self.handshake_timeout = timeout;
         self
     }
+
+    /// Enables or disables insecure bypass of token validation (dev/debug mode).
+    pub fn with_insecure_no_token(mut self, enabled: bool) -> Self {
+        self.insecure_no_token = enabled;
+        self
+    }
 }
 
 /// The core DPI-resistant TCP network listener for EchoMesh Relay.
@@ -335,10 +504,14 @@ impl RelayListener {
     pub async fn bind(config: ListenerConfig) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
-        let validator = TokenValidator::new(config.secret_token.clone());
+        let mut validator = TokenValidator::new(config.secret_token.clone());
+        if config.insecure_no_token {
+            validator = validator.with_insecure_no_token(true);
+        }
 
         info!(
             max_connections = config.max_connections,
+            insecure_no_token = config.insecure_no_token,
             "echomesh TCP listener bound successfully"
         );
 
@@ -473,7 +646,7 @@ async fn handle_connection(
     let read_result =
         tokio::time::timeout(config.handshake_timeout, client_stream.read(&mut temp)).await;
 
-    let n = match read_result {
+    let _n = match read_result {
         Ok(Ok(n)) if n > 0 => {
             initial_buf.extend_from_slice(&temp[..n]);
             n
@@ -487,13 +660,20 @@ async fn handle_connection(
             return;
         }
         Err(_) => {
-            warn!(%peer_addr, "handshake timeout waiting for initial data");
+            warn!(%peer_addr, "Handshake timed out waiting for relay response");
             return;
         }
     };
 
     let hex_prefix = hex_encode(&initial_buf[..initial_buf.len().min(16)]);
-    debug!(%peer_addr, bytes_read = n, hex_prefix = %hex_prefix, "read first incoming message");
+    info!(
+        %peer_addr,
+        bytes_len = initial_buf.len(),
+        hex_prefix = %hex_prefix,
+        "Received initial frame: bytes.len()={}, hex_prefix={}",
+        initial_buf.len(),
+        hex_prefix
+    );
 
     // Check if initial packet is TLS Handshake (Pseudo-TLS) or direct Noise handshake
     if initial_buf[0] == crate::transport::obfuscation::TLS_HANDSHAKE_CONTENT_TYPE {
@@ -505,7 +685,18 @@ async fn handle_connection(
                     let rec_len = u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
                     consumed_len = 5 + rec_len;
                 }
+                let client_random_hex = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
+                tracing::info!(
+                    "Validating ClientHello from {}. Client random prefix: {}, SNI: {:?}",
+                    peer_addr, client_random_hex, parsed.sni
+                );
                 let valid = validator.validate(&parsed);
+                if !valid {
+                    tracing::warn!(
+                        "ClientHello validation failed for {}. Expected token mismatch. Routing to fallback.",
+                        peer_addr
+                    );
+                }
                 debug!(
                     %peer_addr,
                     is_valid = valid,
@@ -537,7 +728,18 @@ async fn handle_connection(
                                     u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
                                 consumed_len = 5 + rec_len;
                             }
+                            let client_random_hex = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
+                            tracing::info!(
+                                "Validating ClientHello from {}. Client random prefix: {}, SNI: {:?}",
+                                peer_addr, client_random_hex, parsed.sni
+                            );
                             let valid = validator.validate(&parsed);
+                            if !valid {
+                                tracing::warn!(
+                                    "ClientHello validation failed for {}. Expected token mismatch. Routing to fallback.",
+                                    peer_addr
+                                );
+                            }
                             debug!(%peer_addr, is_valid = valid, "ClientHello parsed after reading full record");
                             valid
                         } else {
@@ -568,6 +770,7 @@ async fn handle_connection(
                 warn!("Handshake rejected from {}: {:?}", peer_addr, err);
             }
         } else {
+            warn!("[DPI-Filter] Invalid auth header from {}, fallback triggered", peer_addr.ip());
             debug!(%peer_addr, "unauthenticated TLS client or active scanner detected; proxying to fallback target");
             fall_through_proxy(client_stream, &config.fallback_target, &initial_buf).await;
         }
@@ -587,6 +790,7 @@ async fn handle_connection(
                 warn!("Handshake rejected from {}: {:?}", peer_addr, err);
             }
         } else {
+            warn!("[DPI-Filter] Invalid auth header from {}, fallback triggered", peer_addr.ip());
             debug!(%peer_addr, "unrecognized packet format or HTTP probe; proxying to fallback target");
             fall_through_proxy(client_stream, &config.fallback_target, &initial_buf).await;
         }
@@ -643,7 +847,16 @@ async fn handle_authenticated_noise_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let session = server_noise_handshake(stream, server_private_key, Some(peer_addr)).await?;
+    let session = match server_noise_handshake(stream, server_private_key, Some(peer_addr)).await {
+        Ok(s) => s,
+        Err(e) => {
+            if let crate::transport::noise::NoiseError::Snow(ref snow_err) = e {
+                let err_enum = crate::transport::noise::snow_error_enum(snow_err);
+                warn!(%peer_addr, snow_error = %err_enum, "Handshake failed with snow::Error enum: {}", err_enum);
+            }
+            return Err(Box::new(e));
+        }
+    };
     let mut framed = NoiseFramedStream::new(stream, session);
     debug!(%peer_addr, "Noise framed stream ready for frame exchange");
 
