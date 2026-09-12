@@ -78,7 +78,10 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096);
 
-    let insecure_no_token = args.iter().any(|arg| arg == "--insecure-no-token" || arg == "--dev-mode")
+    let insecure_no_token = args.iter().any(|arg| arg == "--insecure-no-auth" || arg == "--insecure-no-token" || arg == "--dev-mode")
+        || std::env::var("ECHOMESH_INSECURE_NO_AUTH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
         || std::env::var("ECHOMESH_INSECURE_NO_TOKEN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);

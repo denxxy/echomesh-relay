@@ -69,8 +69,8 @@ async fn test_authenticated_client_with_secret_token_connects_and_exchanges_fram
     let noise_session = client_noise_handshake(&mut client_stream, &server_pub).await.unwrap();
     let mut framed_stream = NoiseFramedStream::new(client_stream, noise_session);
 
-    // 4. Send 1420-byte EchoMesh binary frame
-    let session_id: SessionId = [0x77; 16];
+    // 4. Send 1420-byte EchoMesh binary frame to Echo Service
+    let session_id: SessionId = [0xEE; 16];
     let nonce = [1, 2, 3, 4, 5, 6, 7, 8];
     let payload = Bytes::from_static(b"Stateless Relay Noise Payload");
     let outgoing_frame = Frame::new(session_id, nonce, payload.clone()).unwrap();

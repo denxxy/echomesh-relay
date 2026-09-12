@@ -2,6 +2,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::fmt;
 
 use crate::protocol::frame::constant_time_eq;
+pub use crate::config::DEFAULT_SECRET_TOKEN;
+pub use crate::config::DEFAULT_SECRET_TOKEN as DEFAULT_AUTH_TOKEN;
 
 /// Maximum size of initial TLS handshake record we accept (4KB is plenty for ClientHello).
 pub const MAX_CLIENT_HELLO_SIZE: usize = 4096;
@@ -304,6 +306,11 @@ impl TokenValidator {
     pub fn with_insecure_no_token(mut self, enabled: bool) -> Self {
         self.insecure_no_token = enabled;
         self
+    }
+
+    /// Alias for `with_insecure_no_token` for `--insecure-no-auth`.
+    pub fn with_insecure_no_auth(self, enabled: bool) -> Self {
+        self.with_insecure_no_token(enabled)
     }
 
     /// Validates whether the `ParsedClientHello` contains the valid pre-shared secret token

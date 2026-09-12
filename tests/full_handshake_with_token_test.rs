@@ -71,8 +71,8 @@ async fn test_full_handshake_with_valid_token_success() {
         .expect("Noise handshake must succeed with valid token");
     let mut framed = NoiseFramedStream::new(client_stream, noise_session);
 
-    // 4. Exchange encrypted Noise frames
-    let session_id: SessionId = [0xAA; 16];
+    // 4. Exchange encrypted Noise frames with Echo Service
+    let session_id: SessionId = [0xEE; 16];
     let nonce = [1, 2, 3, 4, 5, 6, 7, 8];
     let payload = Bytes::from_static(b"Secret validated frame payload!");
     let frame = Frame::new(session_id, nonce, payload.clone()).unwrap();
@@ -166,7 +166,7 @@ async fn test_insecure_no_token_bypass_allows_connection_without_valid_token() {
         .expect("Noise handshake must succeed when insecure_no_token is enabled");
     let mut framed = NoiseFramedStream::new(client_stream, noise_session);
 
-    let session_id: SessionId = [0xBB; 16];
+    let session_id: SessionId = [0xEE; 16];
     let nonce = [0, 0, 0, 0, 0, 0, 0, 1];
     let payload = Bytes::from_static(b"Bypass test frame payload");
     let frame = Frame::new(session_id, nonce, payload.clone()).unwrap();

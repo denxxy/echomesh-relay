@@ -10,12 +10,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::protocol::frame::Frame;
+use crate::config::{DEFAULT_SECRET_TOKEN, ECHO_SERVICE_PEER_ID};
+use crate::protocol::frame::{constant_time_eq, Frame};
 use crate::transport::noise::{server_noise_handshake, NoiseFramedStream, NOISE_PATTERN};
 use crate::transport::obfuscation::{
     hex_decode, hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator,
     MAX_CLIENT_HELLO_SIZE,
 };
+
+pub use crate::config::ECHO_SERVICE_PEER_ID as ECHO_SERVICE_PEER_ID_CONST;
 
 /// Cryptographic secrets and connection identifiers for an EchoMesh Relay instance.
 #[derive(Clone, PartialEq, Eq)]
@@ -167,16 +170,16 @@ impl RelaySecrets {
     ) -> Result<Self, crate::crypto::KeyError> {
         let keypair = crate::crypto::load_or_generate_keypair(key_path)?;
 
-        let token = match secret_token {
-            Some(s) if !s.is_empty() => s,
-            _ => match read_saved_token(key_path) {
-                Some(saved) => saved,
-                None => {
-                    let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
-                    let token_pair = builder.generate_keypair()?;
-                    token_pair.public
-                }
-            },
+        let token = match read_saved_token(key_path) {
+            Some(saved) => saved,
+            None => {
+                let initial = match secret_token {
+                    Some(s) if !s.is_empty() => s,
+                    _ => DEFAULT_SECRET_TOKEN.to_vec(),
+                };
+                let _ = save_token_files(key_path, &initial, &keypair.public_key_base64);
+                initial
+            }
         };
 
         // Persist token to disk so it does not change across daemon restarts
@@ -488,6 +491,11 @@ impl ListenerConfig {
     pub fn with_insecure_no_token(mut self, enabled: bool) -> Self {
         self.insecure_no_token = enabled;
         self
+    }
+
+    /// Alias for `with_insecure_no_token` for `--insecure-no-auth` support.
+    pub fn with_insecure_no_auth(self, enabled: bool) -> Self {
+        self.with_insecure_no_token(enabled)
     }
 }
 
@@ -862,9 +870,14 @@ where
 
     // Relay processing loop: process or echo valid frames
     while let Some(frame) = framed.recv_frame().await? {
-        debug!(%peer_addr, payload_len = frame.payload.len(), "received frame from client; echoing");
-        let response = Frame::new(frame.session_id, frame.nonce, frame.payload)?;
-        framed.send_frame(&response).await?;
+        let is_echo_service = constant_time_eq(&frame.session_id, &ECHO_SERVICE_PEER_ID[..16]);
+        if is_echo_service {
+            debug!(%peer_addr, payload_len = frame.payload.len(), "echo service loopback: echoing frame back to client");
+            let response = Frame::new(frame.session_id, frame.nonce, frame.payload)?;
+            framed.send_frame(&response).await?;
+        } else {
+            debug!(%peer_addr, "dropping packet; recipient not found");
+        }
     }
 
     debug!(%peer_addr, "Noise session ended normally");
