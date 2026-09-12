@@ -318,6 +318,11 @@ impl TokenValidator {
         self.insecure_no_token
     }
 
+    /// Returns the pre-shared secret token slice.
+    pub fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
     /// Validates whether the `ParsedClientHello` contains the valid pre-shared secret token
     /// in `ClientHello.random` or in the `SNI` field.
     ///

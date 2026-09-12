@@ -18,6 +18,7 @@ use crate::transport::obfuscation::{
     MAX_CLIENT_HELLO_SIZE,
 };
 
+pub use crate::config::ECHO_PEER_ID;
 pub use crate::config::ECHO_SERVICE_PEER_ID as ECHO_SERVICE_PEER_ID_CONST;
 
 /// Cryptographic secrets and connection identifiers for an EchoMesh Relay instance.
@@ -684,24 +685,25 @@ async fn handle_connection(
         debug!(%peer_addr, "detected TLS record header (0x16), parsing ClientHello");
         let mut consumed_len = 0;
         let validate_client = |parsed: &crate::transport::obfuscation::ParsedClientHello| -> bool {
-            let is_dev_mode = validator.is_insecure_no_token()
+            let dev_mode = validator.is_insecure_no_token()
                 || std::env::var("ECHOMESH_INSECURE_NO_AUTH")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
-            let valid = if is_dev_mode {
-                tracing::warn!("DEVELOPER MODE: Token validation bypassed for {}", peer_addr);
+            let is_valid = if dev_mode {
+                tracing::warn!("DEV MODE: Reality token check bypassed for {}", peer_addr);
                 true
             } else {
                 validator.validate(parsed)
             };
-            if !valid {
+            if !is_valid {
                 let random_prefix = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
+                let expected_token_hex = hex_encode(validator.secret());
                 tracing::warn!(
-                    "Auth failed from {}. Client random prefix: {}. Routing to fallback.",
-                    peer_addr, random_prefix
+                    "Auth failed from {}. Client random prefix: {}, SNI: {:?}, Expected token: {}. Routing to fallback.",
+                    peer_addr, random_prefix, parsed.sni, expected_token_hex
                 );
             }
-            valid
+            is_valid
         };
 
         let is_authenticated = match parse_client_hello(&initial_buf) {

@@ -11,7 +11,7 @@ pub mod protocol;
 pub mod server;
 pub mod transport;
 
-pub use config::{DEFAULT_SECRET_TOKEN, ECHO_SERVICE_PEER_ID};
+pub use config::{DEFAULT_SECRET_TOKEN, ECHO_PEER_ID, ECHO_SERVICE_PEER_ID};
 
 pub use crypto::{
     base64_decode, base64_encode, default_key_path, derive_pubkey_path, derive_public_key,
