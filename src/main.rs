@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use echomesh_relay::crypto::{load_or_generate_keypair, resolve_key_file_path};
+use echomesh_relay::crypto::{
+    derive_relay_json_path, derive_token_path, load_or_generate_keypair, resolve_key_file_path,
+};
 use echomesh_relay::server::{ListenerConfig, RelayListener, RelaySecrets};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let secrets = RelaySecrets::load_or_generate(
             &key_file,
             dummy_bind,
-            resolve_secret_token(&args),
+            resolve_or_generate_secret_token(&args, &key_file)?,
         )?;
         println!("{}", secrets.secret_token_hex);
         return Ok(());
@@ -38,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let secrets = RelaySecrets::load_or_generate(
             &key_file,
             dummy_bind,
-            resolve_secret_token(&args),
+            resolve_or_generate_secret_token(&args, &key_file)?,
         )?;
         println!(
             r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"[REDACTED]","key_file":"{}"}}"#,
@@ -90,7 +93,7 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let secrets = RelaySecrets::load_or_generate(
         &key_file,
         bind_addr,
-        resolve_secret_token(&args),
+        resolve_or_generate_secret_token(&args, &key_file)?,
     )?;
     let config = ListenerConfig::new_with_secrets(bind_addr, secrets.clone())
         .with_fallback_target(fallback_target)
@@ -126,6 +129,27 @@ fn env_true(name: &str) -> bool {
     std::env::var(name)
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn resolve_or_generate_secret_token(
+    args: &[String],
+    key_file: &Path,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    if let Some(explicit) = resolve_secret_token(args) {
+        return Ok(Some(explicit));
+    }
+
+    // Existing deployments keep their persisted token. `load_or_generate`
+    // parses these files and fails closed if they are corrupt or empty.
+    if derive_token_path(key_file).exists() || derive_relay_json_path(key_file).exists() {
+        return Ok(None);
+    }
+
+    // First provisioning gets a unique cryptographically random 32-byte token.
+    // Reuse Snow's CSPRNG-backed key generator so no static credential is ever
+    // compiled into the binary or repository.
+    let builder = snow::Builder::new(echomesh_relay::transport::noise::NOISE_PATTERN.parse()?);
+    Ok(Some(builder.generate_keypair()?.public))
 }
 
 fn resolve_secret_token(args: &[String]) -> Option<Vec<u8>> {
