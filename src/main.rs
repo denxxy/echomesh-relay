@@ -46,8 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         if args.iter().any(|arg| arg == "--json") {
             println!(
-                r#"{{"url":"{}","public_key_base64":"{}","secret_token":"[REDACTED]","key_file":"{}"}}"#,
+                r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"[REDACTED]","key_file":"{}"}}"#,
                 secrets.url,
+                secrets.public_key_hex,
                 secrets.public_key_base64,
                 key_file.display()
             );
