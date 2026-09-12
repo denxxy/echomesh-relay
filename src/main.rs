@@ -10,8 +10,10 @@ use echomesh_relay::crypto::{
     derive_relay_json_path, derive_token_path, load_or_generate_keypair, resolve_key_file_path,
 };
 use echomesh_relay::server::{ListenerConfig, RelayListener, RelaySecrets};
+use echomesh_relay::transport::obfuscation::{hex_decode, hex_encode};
 
-const LEGACY_SHARED_TOKEN: &[u8] = b"echomesh_secret_mesh_token_2026";
+// Migration marker only. This legacy credential is public and is never accepted
+// as a production default; persisted copies are rotated on startup.
 const LEGACY_SHARED_TOKEN_HEX: &str =
     "6563686f6d6573685f7365637265745f6d6573685f746f6b656e5f32303236";
 
@@ -31,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let secrets = RelaySecrets::load_or_generate(
             &key_file,
             dummy_bind,
-            resolve_or_generate_secret_token(&args, &key_file)?,
+            Some(resolve_or_generate_secret_token(&args, &key_file)?),
         )?;
         println!("{}", secrets.secret_token_hex);
         return Ok(());
@@ -45,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let secrets = RelaySecrets::load_or_generate(
             &key_file,
             dummy_bind,
-            resolve_or_generate_secret_token(&args, &key_file)?,
+            Some(resolve_or_generate_secret_token(&args, &key_file)?),
         )?;
         println!(
             r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"[REDACTED]","key_file":"{}"}}"#,
@@ -97,7 +99,7 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let secrets = RelaySecrets::load_or_generate(
         &key_file,
         bind_addr,
-        resolve_or_generate_secret_token(&args, &key_file)?,
+        Some(resolve_or_generate_secret_token(&args, &key_file)?),
     )?;
     let config = ListenerConfig::new_with_secrets(bind_addr, secrets.clone())
         .with_fallback_target(fallback_target)
@@ -138,47 +140,76 @@ fn env_true(name: &str) -> bool {
 fn resolve_or_generate_secret_token(
     args: &[String],
     key_file: &Path,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if let Some(explicit) = resolve_secret_token(args) {
-        return Ok(Some(explicit));
+        return Ok(explicit);
     }
 
-    let token_path = derive_token_path(key_file);
-    let json_path = derive_relay_json_path(key_file);
-    let persisted = std::fs::read(&token_path).ok();
-    let persisted_json = std::fs::read_to_string(&json_path).ok();
-    let legacy_persisted = persisted
-        .as_deref()
-        .map(is_legacy_token_file)
-        .unwrap_or(false)
-        || persisted_json
-            .as_deref()
-            .map(|text| text.contains(LEGACY_SHARED_TOKEN_HEX))
-            .unwrap_or(false);
-
-    // Rotate the old repository-wide token instead of silently preserving a
-    // credential that is already public. Passing the new token explicitly to
-    // `load_or_generate` causes both relay.token and relay.json to be replaced.
-    if legacy_persisted {
-        return Ok(Some(generate_secret_token()?));
-    }
-
-    // Existing non-legacy deployments keep their unique persisted token.
-    if token_path.exists() || json_path.exists() {
-        return Ok(None);
+    if let Some(saved) = read_persisted_secret_token(key_file)? {
+        if hex_encode(&saved).eq_ignore_ascii_case(LEGACY_SHARED_TOKEN_HEX) {
+            // The old repository-wide credential is already public. Rotate it
+            // immediately and let `load_or_generate` overwrite persisted files.
+            return generate_secret_token();
+        }
+        return Ok(saved);
     }
 
     // First provisioning gets a unique cryptographically random 32-byte token.
-    Ok(Some(generate_secret_token()?))
+    generate_secret_token()
 }
 
-fn is_legacy_token_file(raw: &[u8]) -> bool {
-    if raw == LEGACY_SHARED_TOKEN {
-        return true;
+fn read_persisted_secret_token(
+    key_file: &Path,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let token_path = derive_token_path(key_file);
+    if token_path.exists() {
+        let raw = std::fs::read(&token_path)?;
+        if raw.len() == 32 {
+            return Ok(Some(raw));
+        }
+        let text = String::from_utf8_lossy(&raw).trim().to_owned();
+        if let Some(decoded) = hex_decode(&text).filter(|token| !token.is_empty()) {
+            return Ok(Some(decoded));
+        }
+        if !text.is_empty() {
+            return Ok(Some(text.into_bytes()));
+        }
+        return Err(format!("empty persisted relay token: {}", token_path.display()).into());
     }
-    let text = String::from_utf8_lossy(raw);
-    let trimmed = text.trim();
-    trimmed.as_bytes() == LEGACY_SHARED_TOKEN || trimmed.eq_ignore_ascii_case(LEGACY_SHARED_TOKEN_HEX)
+
+    let json_path = derive_relay_json_path(key_file);
+    if json_path.exists() {
+        let content = std::fs::read_to_string(&json_path)?;
+        for key in &["\"secret_token_hex\":", "\"secret_token\":"] {
+            if let Some(pos) = content.find(key) {
+                let rest = &content[pos + key.len()..];
+                let start = rest
+                    .find('"')
+                    .ok_or_else(|| format!("invalid relay credentials: {}", json_path.display()))?
+                    + 1;
+                let tail = &rest[start..];
+                let end = tail
+                    .find('"')
+                    .ok_or_else(|| format!("invalid relay credentials: {}", json_path.display()))?;
+                let value = tail[..end].trim();
+                if let Some(decoded) = hex_decode(value).filter(|token| !token.is_empty()) {
+                    return Ok(Some(decoded));
+                }
+                if !value.is_empty() && value != "[REDACTED]" {
+                    return Ok(Some(value.as_bytes().to_vec()));
+                }
+                return Err(
+                    format!("empty or redacted persisted relay token: {}", json_path.display())
+                        .into(),
+                );
+            }
+        }
+        return Err(
+            format!("relay credentials contain no token: {}", json_path.display()).into(),
+        );
+    }
+
+    Ok(None)
 }
 
 fn generate_secret_token() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
