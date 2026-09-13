@@ -20,7 +20,7 @@ use crate::transport::obfuscation::{
     TLS_HANDSHAKE_CONTENT_TYPE,
 };
 
-pub use super::listener::{ListenerConfig, RelaySecrets};
+pub use super::config::{ListenerConfig, RelaySecrets};
 
 pub const ROUTE_REGISTRATION_ID: [u8; 16] = [0xF0; 16];
 const ECHO_ROUTE_ID: [u8; 16] = [0xEE; 16];
