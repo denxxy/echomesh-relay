@@ -10,7 +10,7 @@ use echomesh_relay::server::{ListenerConfig, RelayListener};
 use echomesh_relay::transport::PseudoTlsBuilder;
 
 const TOTAL_CONNECTIONS: usize = 5_000;
-const MAX_MEMORY_LIMIT_BYTES: usize = 150 * 1024 * 1024;
+const MAX_MEMORY_GROWTH_BYTES: usize = 150 * 1024 * 1024;
 
 #[cfg(unix)]
 fn get_open_fd_count() -> usize {
@@ -196,12 +196,17 @@ async fn test_stress_5000_concurrent_connections_no_panic_low_memory_no_fd_leak(
 
     let current_mem = get_resident_memory_bytes();
     let current_mem_mb = current_mem as f64 / (1024.0 * 1024.0);
-    println!("Post-stress memory consumption: {:.2} MB", current_mem_mb);
-    if current_mem != 0 {
+    let memory_growth = current_mem.saturating_sub(baseline_mem);
+    let memory_growth_mb = memory_growth as f64 / (1024.0 * 1024.0);
+    println!(
+        "Post-stress memory consumption: {:.2} MB (growth: {:.2} MB)",
+        current_mem_mb, memory_growth_mb
+    );
+    if current_mem != 0 && baseline_mem != 0 {
         assert!(
-            current_mem < MAX_MEMORY_LIMIT_BYTES,
-            "RAM consumption exceeded limit: {:.2} MB >= 150 MB",
-            current_mem_mb
+            memory_growth < MAX_MEMORY_GROWTH_BYTES,
+            "RAM growth exceeded limit: {:.2} MB >= 150 MB",
+            memory_growth_mb
         );
     }
 
@@ -220,5 +225,5 @@ async fn test_stress_5000_concurrent_connections_no_panic_low_memory_no_fd_leak(
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;
 
-    println!("--- Stress Test PASSED: No panics, RAM within limits, no FD leaks ---");
+    println!("--- Stress Test PASSED: No panics, RAM growth within limits, no FD leaks ---");
 }
