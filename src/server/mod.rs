@@ -1,3 +1,5 @@
-pub mod listener;
+pub mod router;
+pub mod secure_listener;
 
-pub use listener::{ListenerConfig, PrefixedStream, RelayListener, RelaySecrets};
+pub use router::{RelayRouter, RouteId, RouteResult, ROUTER_CONTROL_ID};
+pub use secure_listener::{ListenerConfig, PrefixedStream, RelayListener, RelaySecrets};

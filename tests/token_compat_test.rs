@@ -4,43 +4,35 @@ use echomesh_relay::transport::{
 };
 
 #[test]
-fn test_token_compat_client_hello() {
-    // Build ClientHello using default secret token
-    let tls_builder = PseudoTlsBuilder::new(DEFAULT_SECRET_TOKEN, "cloudflare.com");
-    let client_hello_buf = tls_builder.build();
+fn test_default_token_is_not_a_shared_credential() {
+    assert!(DEFAULT_SECRET_TOKEN.is_empty());
 
-    // Parse the generated TLS record
-    let status = parse_client_hello(&client_hello_buf);
-    let parsed = match status {
+    let client_hello_buf = PseudoTlsBuilder::new(DEFAULT_SECRET_TOKEN, "cloudflare.com").build();
+    let parsed = match parse_client_hello(&client_hello_buf) {
         ClientHelloStatus::Complete(p) => p,
-        other => panic!("Expected ClientHelloStatus::Complete, got {:?}", other),
+        other => panic!("Expected ClientHelloStatus::Complete, got {other:?}"),
     };
 
-    // Validate using server TokenValidator configured with DEFAULT_SECRET_TOKEN
-    let validator = TokenValidator::new(DEFAULT_SECRET_TOKEN);
-    let valid = validator.validate(&parsed);
     assert!(
-        valid,
-        "Server TokenValidator must successfully validate ClientHello generated with DEFAULT_SECRET_TOKEN"
+        !TokenValidator::new(DEFAULT_SECRET_TOKEN).validate(&parsed),
+        "empty production default must never authenticate"
     );
 }
 
 #[test]
 fn test_token_compat_custom_token() {
     let custom_token = b"custom_secret_test_token_123456";
-    let tls_builder = PseudoTlsBuilder::new(custom_token.to_vec(), "cloudflare.com");
-    let client_hello_buf = tls_builder.build();
+    let client_hello_buf =
+        PseudoTlsBuilder::new(custom_token.to_vec(), "cloudflare.com").build();
 
-    let status = parse_client_hello(&client_hello_buf);
-    let parsed = match status {
+    let parsed = match parse_client_hello(&client_hello_buf) {
         ClientHelloStatus::Complete(p) => p,
-        other => panic!("Expected ClientHelloStatus::Complete, got {:?}", other),
+        other => panic!("Expected ClientHelloStatus::Complete, got {other:?}"),
     };
 
-    let validator = TokenValidator::new(custom_token);
-    let valid = validator.validate(&parsed);
-    assert!(valid, "Server TokenValidator must validate matching custom secret");
-
-    let wrong_validator = TokenValidator::new(b"different_secret_token_abcdefgh");
-    assert!(!wrong_validator.validate(&parsed), "Server TokenValidator must reject mismatching token");
+    assert!(TokenValidator::new(custom_token.to_vec()).validate(&parsed));
+    assert!(
+        !TokenValidator::new(b"different_secret_token_abcdefgh".to_vec()).validate(&parsed),
+        "server must reject a mismatching credential"
+    );
 }

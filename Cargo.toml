@@ -11,6 +11,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 snow = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
 
 [profile.release]
 lto = true

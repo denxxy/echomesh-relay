@@ -5,23 +5,21 @@ use echomesh_relay::transport::{
 
 #[test]
 fn test_pseudo_tls_compat_client_hello() {
-    // 1. Client PseudoTlsBuilder generates ClientHello buffer
-    let tls_builder = PseudoTlsBuilder::new(DEFAULT_SECRET_TOKEN, "cloudflare.com");
-    let client_hello_buf = tls_builder.build();
+    let token = b"pseudo-tls-compat-test-token";
+    let client_hello_buf = PseudoTlsBuilder::new(token.to_vec(), "cloudflare.com").build();
 
-    // 2. Server parses ClientHello
-    let status = parse_client_hello(&client_hello_buf);
-    let parsed = match status {
+    let parsed = match parse_client_hello(&client_hello_buf) {
         ClientHelloStatus::Complete(p) => p,
-        other => panic!("Expected ClientHelloStatus::Complete, got {:?}", other),
+        other => panic!("Expected ClientHelloStatus::Complete, got {other:?}"),
     };
 
-    // 3. Server TokenValidator validates against DEFAULT_SECRET_TOKEN
-    let validator = TokenValidator::new(DEFAULT_SECRET_TOKEN);
-    let is_valid = validator.validate(&parsed);
-
+    assert!(TokenValidator::new(token.to_vec()).validate(&parsed));
     assert!(
-        is_valid,
-        "TokenValidator::new(DEFAULT_SECRET_TOKEN).validate(&parsed) must return true"
+        DEFAULT_SECRET_TOKEN.is_empty(),
+        "production default must not be a shared compiled-in credential"
+    );
+    assert!(
+        !TokenValidator::new(DEFAULT_SECRET_TOKEN).validate(&parsed),
+        "empty production default must never authenticate a client"
     );
 }
