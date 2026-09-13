@@ -23,6 +23,7 @@ use crate::transport::obfuscation::{
 pub use super::listener::{ListenerConfig, RelaySecrets};
 
 pub const ROUTE_REGISTRATION_ID: [u8; 16] = [0xF0; 16];
+const ECHO_ROUTE_ID: [u8; 16] = [0xEE; 16];
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 type RouteId = [u8; 16];
 
@@ -135,8 +136,6 @@ async fn handle_connection(
         return handle_routed_noise_session(stream,&config.secrets.private_key,routes,peer_addr).await;
     }
 
-    // Direct Noise is intentionally a dev-only path. In production every client must
-    // present the pseudo-TLS credential before the relay accepts a Noise handshake.
     let msg_len=if initial.len()>=2{u16::from_be_bytes([initial[0],initial[1]]) as usize}else{0};
     if config.insecure_no_token && (32..=128).contains(&msg_len) {
         let stream=PrefixedStream::new(initial,client_stream);
@@ -180,7 +179,9 @@ where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
     let mut registered_route:Option<RouteId>=None;
     loop {
         let len=match reader.read_u16().await {Ok(v)=>v as usize,Err(err) if err.kind()==std::io::ErrorKind::UnexpectedEof=>break,Err(err)=>return Err(Box::new(err))};
-        if len==0||len>ENCRYPTED_FRAME_SIZE{return Err(format!("invalid encrypted frame length: {}",len).into());}
+        if len==0||len>ENCRYPTED_FRAME_SIZE{
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData,format!("invalid encrypted frame length: {}",len))));
+        }
         let mut buf=vec![0u8;len];reader.read_exact(&mut buf).await?;
         let frame={let mut noise:tokio::sync::MutexGuard<'_,NoiseSession>=session.lock().await;noise.decrypt_frame(&buf)?};
 
@@ -191,7 +192,10 @@ where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
             if let Some(previous)=previous {debug!(previous_connection_id=previous.connection_id,connection_id,"route registration replaced stale connection");}
             registered_route=Some(route_id);debug!(%peer_addr,connection_id,route=%hex::encode(route_id),"peer route registered");continue;
         }
-        if frame.session_id==ECHO_SERVICE_PEER_ID[..16] {out_tx.send(frame).await.map_err(|_|"writer closed")?;continue;}
+        if frame.session_id==ECHO_ROUTE_ID {
+            out_tx.send(frame).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::BrokenPipe,"relay writer closed"))?;
+            continue;
+        }
         let Some(source_route)=registered_route else{warn!(%peer_addr,"dropping unregistered client frame");continue;};
         let target=frame.session_id;let target_entry=routes.read().await.get(&target).cloned();
         if let Some(entry)=target_entry {
