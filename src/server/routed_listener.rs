@@ -12,7 +12,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::config::ECHO_SERVICE_PEER_ID;
 use crate::protocol::frame::Frame;
 use crate::transport::noise::{server_noise_handshake, NoiseSession, ENCRYPTED_FRAME_SIZE};
 use crate::transport::obfuscation::{

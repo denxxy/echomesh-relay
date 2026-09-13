@@ -682,7 +682,7 @@ async fn handle_connection(
 
     // Check if initial packet is TLS Handshake (Pseudo-TLS) or direct Noise handshake
     if initial_buf[0] == crate::transport::obfuscation::TLS_HANDSHAKE_CONTENT_TYPE {
-        debug!(%peer_addr, "detected TLS record header (0x16), parsing ClientHello");
+        debug!("detected TLS record header (0x16), parsing ClientHello");
         let mut consumed_len = 0;
         let validate_client = |parsed: &crate::transport::obfuscation::ParsedClientHello| -> bool {
             let dev_mode = validator.is_insecure_no_token()
@@ -690,14 +690,14 @@ async fn handle_connection(
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
             let is_valid = if dev_mode {
-                tracing::warn!("DEV MODE: Reality token check bypassed for {}", peer_addr);
+                tracing::warn!("DEV MODE: Reality token check bypassed");
                 true
             } else {
                 validator.validate(parsed)
             };
             if !is_valid {
-                let random_prefix = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
-                let expected_token_hex = hex_encode(validator.secret());
+                
+                
                 tracing::warn!(
                     "Auth failed from {}. Client random prefix: {}, SNI: {:?}, Expected token: {}. Routing to fallback.",
                     peer_addr, random_prefix, parsed.sni, expected_token_hex
