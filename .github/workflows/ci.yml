@@ -25,7 +25,8 @@ jobs:
       - name: Reject historical compiled secret
         shell: bash
         run: |
-          if grep -R --line-number --exclude-dir=.git 'echomesh_secret_mesh_token_2026' .; then
+          needle="echomesh_secret_mesh""_token_2026"
+          if grep -R --line-number --exclude-dir=.git "$needle" .; then
             echo 'compiled secret found'
             exit 1
           fi
