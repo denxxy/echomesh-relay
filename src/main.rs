@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! EchoMesh Stateless Relay Binary Entrypoint.
+//! EchoMesh relay binary entrypoint.
+//! Secrets are never printed during normal daemon startup.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -13,9 +14,6 @@ use echomesh_relay::server::{ListenerConfig, RelayListener, RelaySecrets};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Early exit for --show-public-key or subcommand show-key:
-    // Strictly evaluated at the very start of main before any network runtime initialization,
-    // socket binding, address resolution, or tracing subscriber setup.
     if args.iter().any(|arg| arg == "--show-public-key" || arg == "show-key") {
         let key_file = resolve_key_file_path(&args);
         let keypair = load_or_generate_keypair(&key_file)?;
@@ -23,30 +21,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Early exit for --show-credentials:
-    // Strictly evaluated before network runtime initialization or socket binding to avoid AddrInUse
+    // Explicit credential export remains available for provisioning, but it is never
+    // emitted by daemon startup or tracing. Protect stdout at the process boundary.
     if args.iter().any(|arg| arg == "--show-credentials") {
         let key_file = resolve_key_file_path(&args);
         let dummy_bind: SocketAddr = "0.0.0.0:8443".parse().unwrap();
-        let secret_token_opt = resolve_secret_token(&args);
-        let secrets = RelaySecrets::load_or_generate(&key_file, dummy_bind, secret_token_opt)?;
+        let secrets = load_secure_secrets(&key_file, dummy_bind, resolve_secret_token(&args))?;
         println!(
-            "{{\n  \"public_key_base64\": \"{}\",\n  \"secret_token_hex\": \"{}\"\n}}",
+            "{{\"public_key_base64\":\"{}\",\"secret_token_hex\":\"{}\"}}",
             secrets.public_key_base64,
             secrets.secret_token_hex
         );
         return Ok(());
     }
 
-    // Initialize tokio async runtime only for daemon execution
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run_daemon(args))
 }
 
+fn load_secure_secrets(
+    key_file: &std::path::Path,
+    bind_addr: SocketAddr,
+    configured_token: Option<Vec<u8>>,
+) -> Result<RelaySecrets, echomesh_relay::crypto::KeyError> {
+    let first = RelaySecrets::load_or_generate(key_file, bind_addr, configured_token.clone())?;
+    if !first.secret_token.is_empty() {
+        return Ok(first);
+    }
+
+    // Migration path from the historical compiled default: generate a fresh random
+    // credential once and persist it through RelaySecrets' secure file writer.
+    let builder = snow::Builder::new(
+        echomesh_relay::transport::NOISE_PATTERN
+            .parse()
+            .map_err(echomesh_relay::crypto::KeyError::Snow)?,
+    );
+    let random = builder
+        .generate_keypair()
+        .map_err(echomesh_relay::crypto::KeyError::Snow)?
+        .public;
+    RelaySecrets::load_or_generate(key_file, bind_addr, Some(random))
+}
+
 async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing-subscriber with fallback to INFO level
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -55,56 +74,34 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         .init();
 
     let key_file = resolve_key_file_path(&args);
-
-    let bind_str = std::env::var("ECHOMESH_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
+    let bind_str = std::env::var("ECHOMESH_BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let bind_addr: SocketAddr = bind_str.parse().map_err(|e| {
         error!("invalid bind address '{}': {}", bind_str, e);
         e
     })?;
 
-    let secret_token_opt = resolve_secret_token(&args);
-
     let fallback_target = std::env::var("ECHOMESH_FALLBACK_TARGET")
         .unwrap_or_else(|_| "cloudflare.com:443".to_string());
-
     let max_connections: usize = std::env::var("ECHOMESH_MAX_CONNECTIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096);
 
-    let insecure_no_token = args.iter().any(|arg| arg == "--insecure-no-auth" || arg == "--insecure-no-token" || arg == "--dev-mode")
-        || std::env::var("ECHOMESH_INSECURE_NO_AUTH")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+    let insecure_no_token = args.iter().any(|arg| {
+        arg == "--insecure-no-auth" || arg == "--insecure-no-token" || arg == "--dev-mode"
+    }) || std::env::var("ECHOMESH_INSECURE_NO_AUTH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
         || std::env::var("ECHOMESH_INSECURE_NO_TOKEN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
     if insecure_no_token {
-        tracing::warn!("INSECURE MODE ACTIVE: Pseudo-TLS secret token validation is disabled.");
+        tracing::warn!("INSECURE MODE ACTIVE: Pseudo-TLS token validation is disabled");
     }
 
-    let secrets = RelaySecrets::load_or_generate(&key_file, bind_addr, secret_token_opt)?;
-
-    // Handle CLI inspection flags: --secrets or --show-secrets or --json
-    let wants_json = args.iter().any(|arg| arg == "--json");
-    if args.iter().any(|arg| arg == "--secrets" || arg == "--show-secrets") {
-        if wants_json {
-            println!(
-                r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"{}","secret_token":"{}","key_file":"{}"}}"#,
-                secrets.url,
-                secrets.public_key_hex,
-                secrets.public_key_base64,
-                secrets.secret_token_hex,
-                String::from_utf8_lossy(&secrets.secret_token),
-                key_file.display()
-            );
-        } else {
-            println!("{}", secrets);
-        }
-        return Ok(());
-    }
-
+    let secrets = load_secure_secrets(&key_file, bind_addr, resolve_secret_token(&args))?;
     let config = ListenerConfig::new_with_secrets(bind_addr, secrets.clone())
         .with_fallback_target(fallback_target)
         .with_max_connections(max_connections)
@@ -113,90 +110,27 @@ async fn run_daemon(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
 
     let listener = RelayListener::bind(config).await?;
 
-    let startup_banner = format!(
-        "=====================================================\n\
-EchoMesh Relay Active\n\
-Bind: {}\n\
-Noise Public Key: {}\n\
-Secret Token (Hex): {}\n\
-=====================================================",
-        bind_addr,
-        secrets.public_key_base64,
-        secrets.secret_token_hex
-    );
-
-    // Guaranteed banner output to stdout and tracing
-    println!("{}", startup_banner);
-    info!("{}", startup_banner);
-
-    // Return secrets prominently on startup to stdout
-    if wants_json {
-        println!(
-            r#"{{"url":"{}","public_key_hex":"{}","public_key_base64":"{}","secret_token_hex":"{}","secret_token":"{}","key_file":"{}"}}"#,
-            secrets.url,
-            secrets.public_key_hex,
-            secrets.public_key_base64,
-            secrets.secret_token_hex,
-            String::from_utf8_lossy(&secrets.secret_token),
-            key_file.display()
-        );
-    } else {
-        println!(
-            r#"
-================================================================================
-                    ECHOMESH STATELESS RELAY INITIALIZED
-================================================================================
-  Server Bind:                 {}
-  Fallback Camouflage:         {}
-  Max Connections:             {}
-  Key File:                    {}
-
-  [AUTHENTICATION & CRYPTO SECRETS]
-  Secret Token (Raw):          {}
-  Secret Token (Hex):          {}
-  Public Key (Hex):            {}
-  Public Key (Base64):         {}
-
-  [CLIENT CONFIGURATION / MTGRAM SETTINGS]
-  Relay URL:                   {}
-  Relay Public Key:            {}
-  Noise Static Public (Base64):{}
-================================================================================
-"#,
-            bind_addr,
-            listener.config().fallback_target,
-            listener.config().max_connections,
-            key_file.display(),
-            String::from_utf8_lossy(&secrets.secret_token),
-            secrets.secret_token_hex,
-            secrets.public_key_hex,
-            secrets.public_key_base64,
-            secrets.url,
-            secrets.public_key_hex,
-            secrets.public_key_base64,
-        );
-    }
-
+    println!("EchoMesh Relay Active");
+    println!("Bind: {}", bind_addr);
+    println!("Noise Public Key: {}", secrets.public_key_base64);
+    println!("Credentials: hidden (use --show-credentials explicitly for provisioning)");
     info!(
-        url = %secrets.url,
-        public_key_hex = %secrets.public_key_hex,
+        bind = %bind_addr,
         public_key_base64 = %secrets.public_key_base64,
-        secret_token_hex = %secrets.secret_token_hex,
         key_file = %key_file.display(),
         "echomesh-relay started successfully"
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            info!("shutdown signal received, closing listener...");
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!("shutdown signal received");
             let _ = shutdown_tx.send(true);
         }
     });
 
     listener.run_with_shutdown(shutdown_rx).await?;
     info!("echomesh-relay stopped cleanly");
-
     Ok(())
 }
 
@@ -223,4 +157,3 @@ fn resolve_secret_token(args: &[String]) -> Option<Vec<u8>> {
                 .map(|s| s.into_bytes())
         })
 }
-

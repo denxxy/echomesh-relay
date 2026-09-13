@@ -23,7 +23,8 @@ fn get_open_fd_count() -> usize {
     }
 }
 
-/// Returns the resident memory size (RSS) in bytes.
+/// Returns the resident memory size (RSS) in bytes when the platform exposes
+/// a compatible low-level API without adding a platform-specific dependency.
 fn get_resident_memory_bytes() -> usize {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -45,16 +46,24 @@ fn get_resident_memory_bytes() -> usize {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     unsafe {
         use std::mem::MaybeUninit;
         let mut usage: libc::rusage = MaybeUninit::zeroed().assume_init();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
-            // On Linux, ru_maxrss is in kilobytes
+            // On Linux, ru_maxrss is in kilobytes.
             (usage.ru_maxrss as usize) * 1024
         } else {
             0
         }
+    }
+
+    #[cfg(windows)]
+    {
+        // The libc crate does not expose getrusage on Windows. Returning 0 keeps
+        // this stress test portable without introducing a Windows API dependency;
+        // functional and concurrency invariants are still exercised there.
+        0
     }
 }
 
@@ -104,7 +113,6 @@ fn generate_fuzz_payload(index: usize) -> Vec<u8> {
         _ => Vec::new(),
     }
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_stress_5000_concurrent_connections_no_panic_low_memory_no_fd_leak() {
@@ -198,29 +206,33 @@ async fn test_stress_5000_concurrent_connections_no_panic_low_memory_no_fd_leak(
         "All active connection permits should be returned to zero"
     );
 
-    // Invariant 2: Memory consumption must remain < 150 MB
+    // Invariant 2: Memory consumption must remain < 150 MB where measurable.
     let current_mem = get_resident_memory_bytes();
     let current_mem_mb = current_mem as f64 / (1024.0 * 1024.0);
     println!("Post-stress memory consumption: {:.2} MB", current_mem_mb);
-    assert!(
-        current_mem < MAX_MEMORY_LIMIT_BYTES,
-        "RAM consumption exceeded limit: {:.2} MB >= 150 MB",
-        current_mem_mb
-    );
+    if current_mem != 0 {
+        assert!(
+            current_mem < MAX_MEMORY_LIMIT_BYTES,
+            "RAM consumption exceeded limit: {:.2} MB >= 150 MB",
+            current_mem_mb
+        );
+    }
 
-    // Invariant 3: Zero file descriptor leaks
-    // Allow brief grace period for OS TCP TIME_WAIT / cleanup
+    // Invariant 3: Zero file descriptor leaks on platforms exposing fd directories.
+    // Allow brief grace period for OS TCP TIME_WAIT / cleanup.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let final_fd = get_open_fd_count();
     println!("Post-stress open file descriptors: {} (baseline was {})", final_fd, baseline_fd);
 
-    // Check that open FDs returned back close to baseline (allowing a margin of 15 for runtime threads/pools)
-    assert!(
-        final_fd <= baseline_fd + 15,
-        "File descriptor leak detected: final FDs ({}) significantly exceeded baseline ({})",
-        final_fd,
-        baseline_fd
-    );
+    if baseline_fd != 0 || final_fd != 0 {
+        // Check that open FDs returned back close to baseline (allowing a margin of 15 for runtime threads/pools)
+        assert!(
+            final_fd <= baseline_fd + 15,
+            "File descriptor leak detected: final FDs ({}) significantly exceeded baseline ({})",
+            final_fd,
+            baseline_fd
+        );
+    }
 
     // Graceful shutdown
     let _ = shutdown_tx.send(true);

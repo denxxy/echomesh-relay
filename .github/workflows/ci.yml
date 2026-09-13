@@ -1,0 +1,50 @@
+name: relay-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo check
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --all-targets 2>&1 | tee cargo-check.log
+      - name: Cargo test
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --all-targets 2>&1 | tee cargo-test.log
+      - name: Upload cargo diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-diagnostics-${{ matrix.os }}
+          path: |
+            cargo-check.log
+            cargo-test.log
+          if-no-files-found: ignore
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject historical compiled secret
+        shell: bash
+        run: |
+          needle="echomesh_secret_mesh""_token_2026"
+          if grep -R --line-number --exclude-dir=.git "$needle" .; then
+            echo 'compiled secret found'
+            exit 1
+          fi
