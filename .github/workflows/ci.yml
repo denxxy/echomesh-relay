@@ -15,8 +15,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
-      - run: cargo test --all-targets
+      - name: Cargo check
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --all-targets 2>&1 | tee cargo-check.log
+      - name: Cargo test
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --all-targets 2>&1 | tee cargo-test.log
+      - name: Upload cargo diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-diagnostics-${{ matrix.os }}
+          path: |
+            cargo-check.log
+            cargo-test.log
+          if-no-files-found: ignore
 
   secret-scan:
     runs-on: ubuntu-latest
