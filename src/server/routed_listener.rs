@@ -95,7 +95,7 @@ impl RelayListener {
                 _=shutdown_rx.changed()=>{if *shutdown_rx.borrow(){break;}continue;}
             };
             let config=Arc::clone(&self.config); let validator=self.validator.clone(); let routes=Arc::clone(&self.routes);
-            tokio::spawn(async move { let _permit=permit; if let Err(err)=handle_connection(stream,config,validator,routes,peer_addr).await { debug!(%peer_addr,?err,"connection ended"); } });
+            tokio::spawn(async move { let _permit=permit; if let Err(err)=handle_connection(stream,config,validator,routes,peer_addr).await { debug!(?err,"connection ended"); } });
         }
         Ok(())
     }
@@ -159,10 +159,10 @@ async fn handle_routed_noise_session<S>(
     mut stream:S,
     server_private_key:&[u8],
     routes:RouteRegistry,
-    peer_addr:SocketAddr,
+    _peer_addr:SocketAddr,
 )->Result<(),Box<dyn std::error::Error+Send+Sync>>
 where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
-    let session=server_noise_handshake(&mut stream,server_private_key,Some(peer_addr)).await?;
+    let session=server_noise_handshake(&mut stream,server_private_key,None).await?;
     let session=Arc::new(tokio::sync::Mutex::new(session));
     let (mut reader,mut writer)=tokio::io::split(stream);
     let (out_tx,mut out_rx)=mpsc::channel::<Frame>(256);
@@ -186,22 +186,22 @@ where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
         let frame={let mut noise:tokio::sync::MutexGuard<'_,NoiseSession>=session.lock().await;noise.decrypt_frame(&buf)?};
 
         if frame.session_id==ROUTE_REGISTRATION_ID {
-            if frame.payload.len()!=32 {warn!(%peer_addr,payload_len=frame.payload.len(),"invalid route registration payload");continue;}
+            if frame.payload.len()!=32 {warn!(payload_len=frame.payload.len(),"invalid route registration payload");continue;}
             let mut route_id=[0u8;16];route_id.copy_from_slice(&frame.payload[..16]);
             let previous=routes.write().await.insert(route_id,RouteEntry{connection_id,tx:out_tx.clone()});
             if let Some(previous)=previous {debug!(previous_connection_id=previous.connection_id,connection_id,"route registration replaced stale connection");}
-            registered_route=Some(route_id);debug!(%peer_addr,connection_id,route=%hex::encode(route_id),"peer route registered");continue;
+            registered_route=Some(route_id);debug!(connection_id,"peer route registered");continue;
         }
         if frame.session_id==ECHO_ROUTE_ID {
             out_tx.send(frame).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::BrokenPipe,"relay writer closed"))?;
             continue;
         }
-        let Some(source_route)=registered_route else{warn!(%peer_addr,"dropping unregistered client frame");continue;};
+        let Some(source_route)=registered_route else{warn!("dropping unregistered client frame");continue;};
         let target=frame.session_id;let target_entry=routes.read().await.get(&target).cloned();
         if let Some(entry)=target_entry {
             let mut routed=frame;routed.session_id=source_route;
             if entry.tx.send(routed).await.is_err(){routes.write().await.remove(&target);}
-        } else {debug!(%peer_addr,target=%hex::encode(target),"recipient route not connected");}
+        } else {debug!("recipient route not connected");}
     }
 
     if let Some(route_id)=registered_route {
