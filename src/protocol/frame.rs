@@ -26,29 +26,7 @@ pub type SessionId = [u8; SESSION_ID_SIZE];
 /// Packet nonce (8 bytes).
 pub type Nonce = [u8; NONCE_SIZE];
 
-/// Protocol parsing and encoding errors.
-///
-/// Implements `Copy` and performs zero heap allocations (no `String`, `Box`, or `Vec`).
-#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
-pub enum ProtocolError {
-    /// Frame length is shorter than the strictly required 1420 bytes.
-    #[error("frame is too short: expected {expected} bytes, got {actual}")]
-    FrameTooShort { expected: usize, actual: usize },
-
-    /// PayloadLength field exceeds the maximum payload size (1394 bytes).
-    #[error("payload length {actual} exceeds maximum allowed size of {max} bytes")]
-    PayloadTooLarge { actual: usize, max: usize },
-
-    /// General I/O error wrapper required by `tokio_util::codec::Decoder`.
-    #[error("I/O error occurred")]
-    Io,
-}
-
-impl From<std::io::Error> for ProtocolError {
-    fn from(_: std::io::Error) -> Self {
-        ProtocolError::Io
-    }
-}
+pub use crate::error::ProtocolError;
 
 /// A parsed protocol frame.
 ///

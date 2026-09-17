@@ -11,7 +11,10 @@ use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::{DEFAULT_SECRET_TOKEN, ECHO_SERVICE_PEER_ID};
-use crate::protocol::frame::{constant_time_eq, Frame};
+use crate::server::connections::ConnectionManager;
+use crate::server::networking::ServerPipeline;
+use crate::server::routing::{ServerInboundRouter, ServerOutboundRouter};
+use crate::server::sessions::SessionManager;
 use crate::transport::noise::{server_noise_handshake, NoiseFramedStream, NOISE_PATTERN};
 use crate::transport::obfuscation::{
     hex_decode, hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator,
@@ -502,6 +505,9 @@ pub struct RelayListener {
     semaphore: Arc<Semaphore>,
     config: Arc<ListenerConfig>,
     validator: TokenValidator,
+    connection_manager: ConnectionManager,
+    session_manager: SessionManager,
+    inbound_router: Arc<ServerInboundRouter>,
 }
 
 impl RelayListener {
@@ -514,6 +520,10 @@ impl RelayListener {
             validator = validator.with_insecure_no_token(true);
         }
 
+        let connection_manager = ConnectionManager::new();
+        let session_manager = SessionManager::new();
+        let inbound_router = Arc::new(ServerInboundRouter::standard_relay());
+
         info!(
             max_connections = config.max_connections,
             insecure_no_token = config.insecure_no_token,
@@ -525,7 +535,25 @@ impl RelayListener {
             semaphore,
             config: Arc::new(config),
             validator,
+            connection_manager,
+            session_manager,
+            inbound_router,
         })
+    }
+
+    /// Returns a reference to the active ConnectionManager.
+    pub fn connection_manager(&self) -> &ConnectionManager {
+        &self.connection_manager
+    }
+
+    /// Returns a reference to the active SessionManager.
+    pub fn session_manager(&self) -> &SessionManager {
+        &self.session_manager
+    }
+
+    /// Returns a reference to the registered ServerInboundRouter.
+    pub fn inbound_router(&self) -> &Arc<ServerInboundRouter> {
+        &self.inbound_router
     }
 
     /// Returns the local socket address this listener is bound to.
@@ -619,11 +647,23 @@ impl RelayListener {
 
             let config = Arc::clone(&self.config);
             let validator = self.validator.clone();
+            let connection_manager = self.connection_manager.clone();
+            let session_manager = self.session_manager.clone();
+            let inbound_router = Arc::clone(&self.inbound_router);
 
             // Spawn lightweight task for each connection
             tokio::spawn(async move {
                 let _permit = permit; // Owned permit is held for lifecycle of connection
-                handle_connection(stream, config, validator, peer_addr).await;
+                handle_connection(
+                    stream,
+                    config,
+                    validator,
+                    peer_addr,
+                    connection_manager,
+                    session_manager,
+                    inbound_router,
+                )
+                .await;
             });
         }
 
@@ -641,6 +681,9 @@ async fn handle_connection(
     config: Arc<ListenerConfig>,
     validator: TokenValidator,
     peer_addr: SocketAddr,
+    connection_manager: ConnectionManager,
+    session_manager: SessionManager,
+    inbound_router: Arc<ServerInboundRouter>,
 ) {
     debug!(%peer_addr, "accepted new TCP connection");
 
@@ -771,7 +814,16 @@ async fn handle_connection(
                 Vec::new()
             };
             let mut stream = PrefixedStream::new(leftover, client_stream);
-            if let Err(err) = handle_authenticated_noise_session(&mut stream, &config.secrets.private_key, peer_addr).await {
+            if let Err(err) = handle_authenticated_noise_session(
+                &mut stream,
+                &config.secrets.private_key,
+                peer_addr,
+                connection_manager,
+                session_manager,
+                inbound_router,
+            )
+            .await
+            {
                 warn!("Handshake rejected from {}: {:?}", peer_addr, err);
             }
         } else {
@@ -791,7 +843,16 @@ async fn handle_connection(
         if (32..=128).contains(&msg_len) {
             debug!(%peer_addr, msg_len, "detected direct Noise handshake message, initiating session");
             let mut stream = PrefixedStream::new(initial_buf, client_stream);
-            if let Err(err) = handle_authenticated_noise_session(&mut stream, &config.secrets.private_key, peer_addr).await {
+            if let Err(err) = handle_authenticated_noise_session(
+                &mut stream,
+                &config.secrets.private_key,
+                peer_addr,
+                connection_manager,
+                session_manager,
+                inbound_router,
+            )
+            .await
+            {
                 warn!("Handshake rejected from {}: {:?}", peer_addr, err);
             }
         } else {
@@ -843,16 +904,20 @@ async fn fall_through_proxy(
     .await;
 }
 
-/// Handles authenticated EchoMesh client session over the Noise protocol.
+/// Handles authenticated EchoMesh client session over the Noise protocol,
+/// dispatching all inbound frames through the `ServerPipeline`.
 async fn handle_authenticated_noise_session<S>(
     stream: &mut S,
     server_private_key: &[u8],
     peer_addr: SocketAddr,
+    connection_manager: ConnectionManager,
+    session_manager: SessionManager,
+    inbound_router: Arc<ServerInboundRouter>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let session = match server_noise_handshake(stream, server_private_key, Some(peer_addr)).await {
+    let noise_session = match server_noise_handshake(stream, server_private_key, Some(peer_addr)).await {
         Ok(s) => s,
         Err(e) => {
             if let crate::transport::noise::NoiseError::Snow(ref snow_err) = e {
@@ -862,21 +927,58 @@ where
             return Err(Box::new(e));
         }
     };
-    let mut framed = NoiseFramedStream::new(stream, session);
+
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(64);
+    let conn_id = connection_manager.register(peer_addr, outbound_tx.clone()).await;
+
+    // Default session ID mapped for this connection
+    let mut session_id = [0u8; 16];
+    session_id.copy_from_slice(&ECHO_SERVICE_PEER_ID[..16]);
+    let session = session_manager.create_session(session_id, None).await;
+    connection_manager.bind_session(conn_id, session_id, None).await;
+
+    let outbound_router = ServerOutboundRouter::new(connection_manager.clone());
+    let mut pipeline = ServerPipeline::new(
+        conn_id,
+        session,
+        outbound_tx,
+        inbound_router,
+        outbound_router,
+        connection_manager.clone(),
+        session_manager.clone(),
+    );
+
+    let mut framed = NoiseFramedStream::new(stream, noise_session);
     debug!(%peer_addr, "Noise framed stream ready for frame exchange");
 
-    // Relay processing loop: process or echo valid frames
-    while let Some(frame) = framed.recv_frame().await? {
-        let is_echo_service = constant_time_eq(&frame.session_id, &ECHO_SERVICE_PEER_ID[..16]);
-        if is_echo_service {
-            debug!(%peer_addr, payload_len = frame.payload.len(), "echo service loopback: echoing frame back to client");
-            let response = Frame::new(frame.session_id, frame.nonce, frame.payload)?;
-            framed.send_frame(&response).await?;
-        } else {
-            debug!(%peer_addr, "dropping packet; recipient not found");
+    loop {
+        tokio::select! {
+            frame_res = framed.recv_frame() => {
+                match frame_res {
+                    Ok(Some(frame)) => {
+                        if let Err(err) = pipeline.process_frame(frame).await {
+                            warn!(%peer_addr, ?err, "pipeline error processing frame");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        debug!(%peer_addr, ?e, "connection read closed");
+                        break;
+                    }
+                }
+            }
+            Some(outbound_frame) = outbound_rx.recv() => {
+                if let Err(err) = framed.send_frame(&outbound_frame).await {
+                    warn!(%peer_addr, ?err, "failed to send outbound frame");
+                    break;
+                }
+            }
         }
     }
 
+    connection_manager.unregister(conn_id).await;
+    session_manager.remove_session(&session_id).await;
     debug!(%peer_addr, "Noise session ended normally");
     Ok(())
 }
+

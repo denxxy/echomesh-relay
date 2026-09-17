@@ -19,10 +19,17 @@ fn create_sample_frames(count: usize) -> Vec<Frame> {
 
 fn create_noise_session_pair() -> (NoiseSession, NoiseSession) {
     let pattern: snow::params::NoiseParams = NOISE_PATTERN.parse().expect("valid noise pattern");
+    let keypair = snow::Builder::new(pattern.clone())
+        .generate_keypair()
+        .expect("generate keypair");
     let mut initiator = snow::Builder::new(pattern.clone())
+        .remote_public_key(&keypair.public)
+        .expect("set remote pub key")
         .build_initiator()
         .expect("initiator builder");
     let mut responder = snow::Builder::new(pattern)
+        .local_private_key(&keypair.private)
+        .expect("set local priv key")
         .build_responder()
         .expect("responder builder");
 

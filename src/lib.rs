@@ -5,12 +5,15 @@
 //! High-throughput, zero-knowledge, DPI-resistant relay proxy following the
 //! EchoMesh Stateless Relay Specification in ARCHITECTURE.md.
 
+pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod error;
 pub mod protocol;
 pub mod server;
 pub mod transport;
 
+pub use client::EchoMeshClient;
 pub use config::{DEFAULT_SECRET_TOKEN, ECHO_PEER_ID, ECHO_SERVICE_PEER_ID};
 
 pub use crypto::{
