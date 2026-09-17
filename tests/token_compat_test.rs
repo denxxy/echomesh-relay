@@ -4,24 +4,35 @@ use echomesh_relay::transport::{
 };
 
 #[test]
-fn test_token_compat_client_hello() {
-    // Build ClientHello using default secret token
+fn test_default_token_does_not_authenticate() {
+    // Production builds intentionally compile with no default authentication secret.
+    assert!(
+        DEFAULT_SECRET_TOKEN.is_empty(),
+        "DEFAULT_SECRET_TOKEN must remain empty so no production secret is compiled into the binary"
+    );
+
     let tls_builder = PseudoTlsBuilder::new(DEFAULT_SECRET_TOKEN, "cloudflare.com");
     let client_hello_buf = tls_builder.build();
 
-    // Parse the generated TLS record
     let status = parse_client_hello(&client_hello_buf);
     let parsed = match status {
         ClientHelloStatus::Complete(p) => p,
         other => panic!("Expected ClientHelloStatus::Complete, got {:?}", other),
     };
 
-    // Validate using server TokenValidator configured with DEFAULT_SECRET_TOKEN
+    // An empty token is not valid authentication. Operators must provision a token
+    // explicitly (or opt into the insecure bypass for local development).
     let validator = TokenValidator::new(DEFAULT_SECRET_TOKEN);
-    let valid = validator.validate(&parsed);
     assert!(
-        valid,
-        "Server TokenValidator must successfully validate ClientHello generated with DEFAULT_SECRET_TOKEN"
+        !validator.validate(&parsed),
+        "TokenValidator must reject authentication when no token is configured"
+    );
+
+    let insecure_validator = TokenValidator::new(DEFAULT_SECRET_TOKEN)
+        .with_insecure_no_token(true);
+    assert!(
+        insecure_validator.validate(&parsed),
+        "Explicit insecure bypass must remain available for development"
     );
 }
 
@@ -42,5 +53,8 @@ fn test_token_compat_custom_token() {
     assert!(valid, "Server TokenValidator must validate matching custom secret");
 
     let wrong_validator = TokenValidator::new(b"different_secret_token_abcdefgh");
-    assert!(!wrong_validator.validate(&parsed), "Server TokenValidator must reject mismatching token");
+    assert!(
+        !wrong_validator.validate(&parsed),
+        "Server TokenValidator must reject mismatching token"
+    );
 }

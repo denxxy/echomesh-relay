@@ -21,19 +21,22 @@ fn create_noise_session_pair() -> (NoiseSession, NoiseSession) {
     let pattern: snow::params::NoiseParams = NOISE_PATTERN.parse().expect("valid noise pattern");
     let keypair = snow::Builder::new(pattern.clone())
         .generate_keypair()
-        .expect("generate keypair");
+        .expect("responder keypair");
+
+    // Noise_NK requires the initiator to know the responder's static public key,
+    // and the responder to own the matching static private key.
     let mut initiator = snow::Builder::new(pattern.clone())
         .remote_public_key(&keypair.public)
-        .expect("set remote pub key")
+        .expect("initiator remote public key")
         .build_initiator()
         .expect("initiator builder");
     let mut responder = snow::Builder::new(pattern)
         .local_private_key(&keypair.private)
-        .expect("set local priv key")
+        .expect("responder private key")
         .build_responder()
         .expect("responder builder");
 
-    // Handshake message 1 (-> e)
+    // Handshake message 1 (-> e, es)
     let mut msg1 = vec![0u8; 128];
     let len1 = initiator.write_message(&[], &mut msg1).expect("msg1 write");
     msg1.truncate(len1);
@@ -112,7 +115,10 @@ fn bench_frame_throughput(c: &mut Criterion) {
             let mut codec = FrameCodec::new();
             for raw in &raw_frames {
                 let mut buf = BytesMut::from(&raw[..]);
-                let parsed = codec.decode(&mut buf).expect("decode succeeds").expect("frame present");
+                let parsed = codec
+                    .decode(&mut buf)
+                    .expect("decode succeeds")
+                    .expect("frame present");
                 black_box(parsed);
             }
         })
@@ -134,7 +140,9 @@ fn bench_noise_latency(c: &mut Criterion) {
     let (mut alice_enc, _) = create_noise_session_pair();
     group.bench_function("noise_encrypt_single_frame", |b| {
         b.iter(|| {
-            let packet = alice_enc.encrypt_frame(black_box(&sample_frame)).expect("encrypt succeeds");
+            let packet = alice_enc
+                .encrypt_frame(black_box(&sample_frame))
+                .expect("encrypt succeeds");
             black_box(packet);
         })
     });
@@ -143,8 +151,12 @@ fn bench_noise_latency(c: &mut Criterion) {
     let (mut alice_rt, mut bob_rt) = create_noise_session_pair();
     group.bench_function("noise_encrypt_decrypt_roundtrip_single_frame", |b| {
         b.iter(|| {
-            let packet = alice_rt.encrypt_frame(black_box(&sample_frame)).expect("encrypt succeeds");
-            let decrypted = bob_rt.decrypt_frame(black_box(&packet[2..])).expect("decrypt succeeds");
+            let packet = alice_rt
+                .encrypt_frame(black_box(&sample_frame))
+                .expect("encrypt succeeds");
+            let decrypted = bob_rt
+                .decrypt_frame(black_box(&packet[2..]))
+                .expect("decrypt succeeds");
             black_box(decrypted);
         })
     });
@@ -161,7 +173,9 @@ fn bench_noise_latency(c: &mut Criterion) {
             },
             |(batch, mut bob)| {
                 for packet in batch {
-                    let frame = bob.decrypt_frame(black_box(&packet[2..])).expect("decrypt frame");
+                    let frame = bob
+                        .decrypt_frame(black_box(&packet[2..]))
+                        .expect("decrypt frame");
                     black_box(frame);
                 }
             },

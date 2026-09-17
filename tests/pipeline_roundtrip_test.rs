@@ -3,13 +3,14 @@ use bytes::Bytes;
 use tokio::sync::watch;
 
 use echomesh_relay::client::EchoMeshClient;
-use echomesh_relay::config::DEFAULT_SECRET_TOKEN;
 use echomesh_relay::protocol::messages::ServerToClientMessage;
-use echomesh_relay::server::{ListenerConfig, RelayListener};
+use echomesh_relay::server::listener::RelayListener;
+use echomesh_relay::server::ListenerConfig;
 
 #[tokio::test]
 async fn test_full_client_server_pipeline_roundtrip() {
-    let secret = DEFAULT_SECRET_TOKEN.to_vec();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let secret = b"pipeline-test-secret-token-12345".to_vec();
 
     // 1. Bind server listener
     let config = ListenerConfig::new("127.0.0.1:0".parse().unwrap(), secret.clone())

@@ -117,7 +117,7 @@ pub fn snow_error_enum(err: &snow::Error) -> String {
 pub async fn server_noise_handshake<S>(
     stream: &mut S,
     server_private_key: &[u8],
-    peer_addr: Option<std::net::SocketAddr>,
+    _peer_addr: Option<std::net::SocketAddr>,
 ) -> Result<NoiseSession, NoiseError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -138,7 +138,6 @@ where
         Err(e) => {
             let err_enum = snow_error_enum(&e);
             tracing::error!(
-                ?peer_addr,
                 error = ?e,
                 snow_error = %err_enum,
                 "Failed building Noise responder with snow::Error enum: {}",
@@ -148,7 +147,7 @@ where
         }
     };
 
-    tracing::debug!(?peer_addr, "Noise responder initialized (pattern: {}), waiting for message 1", NOISE_PATTERN);
+    tracing::debug!("Noise responder initialized (pattern: {}), waiting for message 1", NOISE_PATTERN);
 
     let handshake_timeout = std::time::Duration::from_secs(5);
 
@@ -164,11 +163,11 @@ where
     let (msg1_len, msg1) = match read_res {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
-            tracing::error!(?peer_addr, error = ?e, "Failed reading Noise message 1 from stream");
+            tracing::error!(error = ?e, "Failed reading Noise message 1 from stream");
             return Err(e);
         }
         Err(_) => {
-            tracing::warn!(?peer_addr, "Handshake timed out waiting for relay response");
+            tracing::warn!("Handshake timed out waiting for relay response");
             return Err(NoiseError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Handshake timed out waiting for relay response",
@@ -176,21 +175,15 @@ where
         }
     };
 
-    let hex_prefix = crate::transport::obfuscation::hex_encode(&msg1[..msg1.len().min(16)]);
     tracing::info!(
-        ?peer_addr,
         bytes_len = msg1.len(),
-        hex_prefix = %hex_prefix,
-        "Noise message 1 received: bytes.len()={}, hex_prefix={}",
-        msg1.len(),
-        hex_prefix
+        "Noise message 1 received"
     );
 
     let mut dummy_payload = [0u8; 128];
     if let Err(e) = responder.read_message(&msg1, &mut dummy_payload) {
         let err_enum = snow_error_enum(&e);
         tracing::error!(
-            ?peer_addr,
             error = ?e,
             snow_error = %err_enum,
             msg1_len,
@@ -199,7 +192,7 @@ where
         );
         return Err(NoiseError::Snow(e));
     }
-    tracing::debug!(?peer_addr, msg1_len, "Noise handshake message 1 processed successfully");
+    tracing::debug!(msg1_len, "Noise handshake message 1 processed successfully");
 
     // 2. Generate and write message 2 to client (<- e, ee)
     let mut msg2 = vec![0u8; 128];
@@ -208,7 +201,6 @@ where
         Err(e) => {
             let err_enum = snow_error_enum(&e);
             tracing::error!(
-                ?peer_addr,
                 error = ?e,
                 snow_error = %err_enum,
                 "Noise responder.write_message() failed on message 2 with snow::Error enum: {}",
@@ -222,10 +214,10 @@ where
     stream.write_u16(n2 as u16).await?;
     stream.write_all(&msg2).await?;
     stream.flush().await?;
-    tracing::debug!(?peer_addr, msg2_len = n2, "Noise handshake message 2 sent to client");
+    tracing::debug!(msg2_len = n2, "Noise handshake message 2 sent to client");
 
     let transport = responder.into_transport_mode()?;
-    tracing::debug!(?peer_addr, "Noise handshake completed successfully; entered transport mode");
+    tracing::debug!("Noise handshake completed successfully; entered transport mode");
     Ok(NoiseSession::new(transport))
 }
 

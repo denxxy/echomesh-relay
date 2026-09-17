@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -10,324 +9,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::config::{DEFAULT_SECRET_TOKEN, ECHO_SERVICE_PEER_ID};
+use crate::config::ECHO_SERVICE_PEER_ID;
 use crate::server::connections::ConnectionManager;
 use crate::server::networking::ServerPipeline;
 use crate::server::routing::{ServerInboundRouter, ServerOutboundRouter};
 use crate::server::sessions::SessionManager;
-use crate::transport::noise::{server_noise_handshake, NoiseFramedStream, NOISE_PATTERN};
+use crate::transport::noise::{server_noise_handshake, NoiseFramedStream};
 use crate::transport::obfuscation::{
-    hex_decode, hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator,
+    hex_encode, parse_client_hello, ClientHelloStatus, TokenValidator,
     MAX_CLIENT_HELLO_SIZE,
 };
 
 pub use crate::config::ECHO_PEER_ID;
 pub use crate::config::ECHO_SERVICE_PEER_ID as ECHO_SERVICE_PEER_ID_CONST;
 
-/// Cryptographic secrets and connection identifiers for an EchoMesh Relay instance.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RelaySecrets {
-    /// Pre-shared secret token for Reality/TLS camouflage authentication (raw bytes).
-    pub secret_token: Vec<u8>,
-    /// Pre-shared secret token encoded as hex string.
-    pub secret_token_hex: String,
-    /// Relay X25519 static public key (raw 32 bytes).
-    pub public_key: Vec<u8>,
-    /// Relay X25519 static public key encoded as hex string (64 characters).
-    pub public_key_hex: String,
-    /// Relay X25519 static public key encoded as Base64 string.
-    pub public_key_base64: String,
-    /// Relay X25519 static private key (raw 32 bytes).
-    pub private_key: Vec<u8>,
-    /// Relay X25519 static private key encoded as hex string (64 characters).
-    pub private_key_hex: String,
-    /// Connection endpoint URL (e.g. "https://0.0.0.0:8443").
-    pub url: String,
-    /// Persistent key file path on disk, if loaded from or saved to a file.
-    pub key_file: Option<std::path::PathBuf>,
-}
-
-impl fmt::Debug for RelaySecrets {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Redact private key per security invariant
-        f.debug_struct("RelaySecrets")
-            .field("url", &self.url)
-            .field("public_key_hex", &self.public_key_hex)
-            .field("public_key_base64", &self.public_key_base64)
-            .field("secret_token_hex", &self.secret_token_hex)
-            .field("key_file", &self.key_file)
-            .field("private_key", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl fmt::Display for RelaySecrets {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "EchoMesh Relay Secrets:\n  URL: {}\n  Public Key (Hex): {}\n  Public Key (Base64): {}\n  Secret Token (Hex): {}",
-            self.url, self.public_key_hex, self.public_key_base64, self.secret_token_hex
-        )
-    }
-}
-
-impl RelaySecrets {
-    /// Creates a new `RelaySecrets` bundle from explicit components.
-    pub fn new(
-        secret_token: Vec<u8>,
-        public_key: Vec<u8>,
-        private_key: Vec<u8>,
-        url: impl Into<String>,
-    ) -> Self {
-        let secret_token_hex = hex_encode(&secret_token);
-        let public_key_hex = hex_encode(&public_key);
-        let public_key_base64 = crate::crypto::base64_encode(&public_key);
-        let private_key_hex = hex_encode(&private_key);
-        Self {
-            secret_token,
-            secret_token_hex,
-            public_key,
-            public_key_hex,
-            public_key_base64,
-            private_key,
-            private_key_hex,
-            url: url.into(),
-            key_file: None,
-        }
-    }
-
-    /// Generates a fresh `RelaySecrets` bundle using CSPRNG.
-    /// If `secret_token` is `None` or empty, a 32-byte secure random token is generated.
-    pub fn generate(
-        bind_addr: SocketAddr,
-        secret_token: Option<Vec<u8>>,
-    ) -> Result<Self, snow::Error> {
-        let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
-        let keypair = builder.generate_keypair()?;
-
-        let secret = match secret_token {
-            Some(s) if !s.is_empty() => s,
-            _ => {
-                let token_pair = builder.generate_keypair()?;
-                token_pair.public
-            }
-        };
-
-        let secret_token_hex = hex_encode(&secret);
-        let public_key_hex = hex_encode(&keypair.public);
-        let public_key_base64 = crate::crypto::base64_encode(&keypair.public);
-        let private_key_hex = hex_encode(&keypair.private);
-        let url = format!("https://{}", bind_addr);
-
-        Ok(Self {
-            secret_token: secret,
-            secret_token_hex,
-            public_key: keypair.public,
-            public_key_hex,
-            public_key_base64,
-            private_key: keypair.private,
-            private_key_hex,
-            url,
-            key_file: None,
-        })
-    }
-
-    /// Creates a `RelaySecrets` bundle from a pre-loaded persistent `KeyPair`.
-    pub fn from_keypair(
-        bind_addr: SocketAddr,
-        keypair: crate::crypto::KeyPair,
-        secret_token: Option<Vec<u8>>,
-    ) -> Result<Self, snow::Error> {
-        let secret = match secret_token {
-            Some(s) if !s.is_empty() => s,
-            _ => {
-                let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
-                let token_pair = builder.generate_keypair()?;
-                token_pair.public
-            }
-        };
-
-        let secret_token_hex = hex_encode(&secret);
-        let public_key_hex = hex_encode(&keypair.public_key);
-        let private_key_hex = hex_encode(&keypair.private_key);
-        let url = format!("https://{}", bind_addr);
-
-        Ok(Self {
-            secret_token: secret,
-            secret_token_hex,
-            public_key: keypair.public_key,
-            public_key_hex,
-            public_key_base64: keypair.public_key_base64,
-            private_key: keypair.private_key,
-            private_key_hex,
-            url,
-            key_file: Some(keypair.key_path),
-        })
-    }
-
-    /// Loads an existing key or generates a persistent key at `key_path` and creates `RelaySecrets`.
-    /// Also loads or generates and persists the secret token to companion `relay.token` / `relay.json`.
-    pub fn load_or_generate(
-        key_path: &std::path::Path,
-        bind_addr: SocketAddr,
-        secret_token: Option<Vec<u8>>,
-    ) -> Result<Self, crate::crypto::KeyError> {
-        let keypair = crate::crypto::load_or_generate_keypair(key_path)?;
-
-        let token = if let Some(s) = secret_token.filter(|s| !s.is_empty()) {
-            s
-        } else if let Some(saved) = read_saved_token(key_path) {
-            saved
-        } else {
-            DEFAULT_SECRET_TOKEN.to_vec()
-        };
-
-        // Persist token to disk so it does not change across daemon restarts
-        let _ = save_token_files(key_path, &token, &keypair.public_key_base64);
-
-        let secret_token_hex = hex_encode(&token);
-        let public_key_hex = hex_encode(&keypair.public_key);
-        let private_key_hex = hex_encode(&keypair.private_key);
-        let url = format!("https://{}", bind_addr);
-
-        Ok(Self {
-            secret_token: token,
-            secret_token_hex,
-            public_key: keypair.public_key,
-            public_key_hex,
-            public_key_base64: keypair.public_key_base64,
-            private_key: keypair.private_key,
-            private_key_hex,
-            url,
-            key_file: Some(keypair.key_path),
-        })
-    }
-}
-
-fn read_saved_token(key_path: &std::path::Path) -> Option<Vec<u8>> {
-    let json_path = crate::crypto::derive_relay_json_path(key_path);
-    if json_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&json_path) {
-            if let Some(token) = parse_token_from_json(&content) {
-                return Some(token);
-            }
-        }
-    }
-
-    let token_path = crate::crypto::derive_token_path(key_path);
-    if token_path.exists() {
-        if let Ok(raw) = std::fs::read(&token_path) {
-            if let Some(token) = parse_token_bytes(&raw) {
-                return Some(token);
-            }
-        }
-    }
-
-    None
-}
-
-fn parse_token_from_json(json_str: &str) -> Option<Vec<u8>> {
-    for key in &["\"secret_token_hex\":", "\"secret_token\":"] {
-        if let Some(pos) = json_str.find(key) {
-            let rest = &json_str[pos + key.len()..];
-            if let Some(start_quote) = rest.find('"') {
-                let after_quote = &rest[start_quote + 1..];
-                if let Some(end_quote) = after_quote.find('"') {
-                    let val = after_quote[..end_quote].trim();
-                    if val.len() == 64 {
-                        if let Some(bytes) = hex_decode(val) {
-                            return Some(bytes);
-                        }
-                    }
-                    if !val.is_empty() {
-                        if let Some(bytes) = hex_decode(val) {
-                            return Some(bytes);
-                        }
-                        return Some(val.as_bytes().to_vec());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn parse_token_bytes(raw: &[u8]) -> Option<Vec<u8>> {
-    if raw.len() == 32 {
-        return Some(raw.to_vec());
-    }
-    let text = String::from_utf8_lossy(raw).trim().to_string();
-    if text.len() == 64 {
-        if let Some(bytes) = hex_decode(&text) {
-            return Some(bytes);
-        }
-    }
-    if !text.is_empty() {
-        if let Some(bytes) = hex_decode(&text) {
-            return Some(bytes);
-        }
-        return Some(text.into_bytes());
-    }
-    None
-}
-
-fn save_token_files(
-    key_path: &std::path::Path,
-    secret_token: &[u8],
-    public_key_base64: &str,
-) -> Result<(), std::io::Error> {
-    let token_hex = hex_encode(secret_token);
-    let token_path = crate::crypto::derive_token_path(key_path);
-    let json_path = crate::crypto::derive_relay_json_path(key_path);
-
-    write_secure_file(&token_path, format!("{}\n", token_hex).as_bytes())?;
-
-    let json_content = format!(
-        "{{\n  \"public_key_base64\": \"{}\",\n  \"secret_token_hex\": \"{}\"\n}}\n",
-        public_key_base64, token_hex
-    );
-    write_secure_file(&json_path, json_content.as_bytes())?;
-
-    Ok(())
-}
-
-fn write_secure_file(path: &std::path::Path, data: &[u8]) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        file.flush()?;
-
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-
-    #[cfg(not(unix))]
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(data)?;
-        file.flush()?;
-    }
-
-    Ok(())
-}
+pub use crate::server::config::{ListenerConfig, RelaySecrets};
 
 /// An asynchronous stream adapter that yields a prefixed buffer of bytes
 /// before delegating reads directly to the underlying stream.
@@ -399,105 +95,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
-/// Configuration for `RelayListener`.
-#[derive(Debug, Clone)]
-pub struct ListenerConfig {
-    /// Bind address for the TCP socket.
-    pub bind_addr: SocketAddr,
 
-    /// Maximum concurrent connections permitted (file descriptor exhaustion guard).
-    pub max_connections: usize,
-
-    /// Fallback website target (e.g. "cloudflare.com:443" or "microsoft.com:443").
-    pub fallback_target: String,
-
-    /// Pre-shared secret token required in TLS ClientHello.random or SNI.
-    pub secret_token: Vec<u8>,
-
-    /// Timeout for reading initial ClientHello bytes.
-    pub handshake_timeout: Duration,
-
-    /// Cryptographic secrets bundle for relay authentication and client connection.
-    pub secrets: RelaySecrets,
-
-    /// Insecure bypass flag for dev/debugging without token authentication.
-    pub insecure_no_token: bool,
-}
-
-impl ListenerConfig {
-    /// Creates a new configuration with sensible security defaults.
-    pub fn new(bind_addr: SocketAddr, secret_token: impl Into<Vec<u8>>) -> Self {
-        let token_bytes = secret_token.into();
-        let secrets = RelaySecrets::generate(bind_addr, Some(token_bytes.clone()))
-            .unwrap_or_else(|_| {
-                RelaySecrets::new(
-                    token_bytes.clone(),
-                    vec![0x42; 32],
-                    vec![0x42; 32],
-                    format!("https://{}", bind_addr),
-                )
-            });
-
-        Self {
-            bind_addr,
-            max_connections: 1024,
-            fallback_target: "cloudflare.com:443".to_string(),
-            secret_token: token_bytes,
-            handshake_timeout: Duration::from_secs(5),
-            secrets,
-            insecure_no_token: false,
-        }
-    }
-
-    /// Creates a configuration with an explicit `RelaySecrets` bundle.
-    pub fn new_with_secrets(bind_addr: SocketAddr, secrets: RelaySecrets) -> Self {
-        Self {
-            bind_addr,
-            max_connections: 1024,
-            fallback_target: "cloudflare.com:443".to_string(),
-            secret_token: secrets.secret_token.clone(),
-            handshake_timeout: Duration::from_secs(5),
-            secrets,
-            insecure_no_token: false,
-        }
-    }
-
-    /// Sets the secrets bundle.
-    pub fn with_secrets(mut self, secrets: RelaySecrets) -> Self {
-        self.secret_token = secrets.secret_token.clone();
-        self.secrets = secrets;
-        self
-    }
-
-    /// Sets the fallback target for unauthenticated requests and active DPI probes.
-    pub fn with_fallback_target(mut self, target: impl Into<String>) -> Self {
-        self.fallback_target = target.into();
-        self
-    }
-
-    /// Sets the maximum concurrent connections limit.
-    pub fn with_max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max.max(1);
-        self
-    }
-
-    /// Sets the handshake read timeout.
-    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
-        self.handshake_timeout = timeout;
-        self
-    }
-
-    /// Enables or disables insecure bypass of token validation (dev/debug mode).
-    pub fn with_insecure_no_token(mut self, enabled: bool) -> Self {
-        self.insecure_no_token = enabled;
-        self
-    }
-
-    /// Alias for `with_insecure_no_token` for `--insecure-no-auth` support.
-    pub fn with_insecure_no_auth(self, enabled: bool) -> Self {
-        self.with_insecure_no_token(enabled)
-    }
-}
 
 /// The core DPI-resistant TCP network listener for EchoMesh Relay.
 pub struct RelayListener {
@@ -725,7 +323,7 @@ async fn handle_connection(
 
     // Check if initial packet is TLS Handshake (Pseudo-TLS) or direct Noise handshake
     if initial_buf[0] == crate::transport::obfuscation::TLS_HANDSHAKE_CONTENT_TYPE {
-        debug!(%peer_addr, "detected TLS record header (0x16), parsing ClientHello");
+        debug!("detected TLS record header (0x16), parsing ClientHello");
         let mut consumed_len = 0;
         let validate_client = |parsed: &crate::transport::obfuscation::ParsedClientHello| -> bool {
             let dev_mode = validator.is_insecure_no_token()
@@ -733,17 +331,15 @@ async fn handle_connection(
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
             let is_valid = if dev_mode {
-                tracing::warn!("DEV MODE: Reality token check bypassed for {}", peer_addr);
+                tracing::warn!("DEV MODE: Reality token check bypassed");
                 true
             } else {
                 validator.validate(parsed)
             };
             if !is_valid {
-                let random_prefix = hex_encode(&parsed.random[..parsed.random.len().min(16)]);
-                let expected_token_hex = hex_encode(validator.secret());
                 tracing::warn!(
-                    "Auth failed from {}. Client random prefix: {}, SNI: {:?}, Expected token: {}. Routing to fallback.",
-                    peer_addr, random_prefix, parsed.sni, expected_token_hex
+                    "Auth failed from {}. SNI: {:?}. Routing to fallback.",
+                    peer_addr, parsed.sni
                 );
             }
             is_valid
