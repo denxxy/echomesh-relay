@@ -29,9 +29,8 @@ impl ServerInboundHandler for EchoHandler {
                     let echoed = self.service.process_echo(payload.clone());
                     Ok(Some(ServerToClientMessage::RawEchoResponse { payload: echoed }))
                 }
-                ClientToServerMessage::SendMessage { data, .. } => {
-                    let echoed = self.service.process_echo(data.clone());
-                    Ok(Some(ServerToClientMessage::RawEchoResponse { payload: echoed }))
+                ClientToServerMessage::SendMessage { .. } => {
+                    Err(RoutingError::UnhandledMessageType(message.message_type().to_u8()))
                 }
                 _ => Err(RoutingError::UnhandledMessageType(message.message_type().to_u8())),
             }

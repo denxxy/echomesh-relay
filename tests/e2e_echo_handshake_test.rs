@@ -5,7 +5,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use echomesh_relay::config::ECHO_SERVICE_PEER_ID;
 use echomesh_relay::protocol::{Frame, SessionId};
 use echomesh_relay::server::{ListenerConfig, RelayListener};
 use echomesh_relay::transport::{
@@ -68,22 +67,56 @@ async fn test_e2e_echo_handshake_and_routing() {
         .expect("Noise handshake must succeed with explicitly matching test credential");
     let mut framed = NoiseFramedStream::new(client_stream, noise_session);
 
-    let echo_session_id: SessionId = [0xEE; 16];
-    assert_eq!(&echo_session_id, &ECHO_SERVICE_PEER_ID[..16]);
+    let alice_id = [0xA1u8; 32];
+    let bob_id = [0xB2u8; 32];
+
+    // 1. Alice registers route
+    let reg_alice = Frame::new(
+        echomesh_relay::server::ROUTE_REGISTRATION_ID,
+        [0; 8],
+        Bytes::copy_from_slice(&alice_id),
+    )
+    .unwrap();
+    framed.send_frame(&reg_alice).await.unwrap();
+
+    // 2. Connect Bob and register route
+    let mut bob_stream = TcpStream::connect(relay_addr).await.unwrap();
+    let bob_hello = PseudoTlsBuilder::new(TEST_SECRET_TOKEN.to_vec(), "cloudflare.com").build();
+    bob_stream.write_all(&bob_hello).await.unwrap();
+    bob_stream.flush().await.unwrap();
+
+    let bob_noise = client_noise_handshake(&mut bob_stream, &server_pub).await.unwrap();
+    let mut bob_framed = NoiseFramedStream::new(bob_stream, bob_noise);
+    let reg_bob = Frame::new(
+        echomesh_relay::server::ROUTE_REGISTRATION_ID,
+        [0; 8],
+        Bytes::copy_from_slice(&bob_id),
+    )
+    .unwrap();
+    bob_framed.send_frame(&reg_bob).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 3. Alice sends message to Bob
     let nonce = [1, 2, 3, 4, 5, 6, 7, 8];
-    let payload = Bytes::from_static(b"E2E Echo Payload Test 1420b Wire");
-    let echo_frame = Frame::new(echo_session_id, nonce, payload.clone()).unwrap();
+    let payload = Bytes::from_static(b"E2E Routed Payload Test 1420b Wire");
+    let msg_frame = Frame::new(bob_id[..16].try_into().unwrap(), nonce, payload.clone()).unwrap();
+    framed.send_frame(&msg_frame).await.unwrap();
 
-    framed.send_frame(&echo_frame).await.unwrap();
-
-    let reply = framed
+    // 4. Bob receives Alice's message
+    let bob_reply = bob_framed
         .recv_frame()
         .await
         .unwrap()
-        .expect("relay must return echoed frame for ECHO_SERVICE_PEER_ID");
-    assert_eq!(reply.session_id, echo_session_id);
-    assert_eq!(reply.payload, payload);
+        .expect("Bob must receive routed frame from Alice");
+    assert_eq!(bob_reply.session_id, alice_id[..16]);
+    assert_eq!(bob_reply.payload, payload);
 
+    // 5. Alice MUST NOT receive her own message back (No Echo loopback)
+    let alice_echo_timeout = tokio::time::timeout(Duration::from_millis(300), framed.recv_frame()).await;
+    assert!(alice_echo_timeout.is_err(), "Relay must NOT echo message back to Alice");
+
+    // 6. Unknown recipient dropped
     let unknown_session_id: SessionId = [0x42; 16];
     let unknown_frame = Frame::new(unknown_session_id, [0; 8], Bytes::from_static(b"drop me")).unwrap();
     framed.send_frame(&unknown_frame).await.unwrap();

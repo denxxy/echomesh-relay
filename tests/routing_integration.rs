@@ -88,7 +88,7 @@ async fn reconnect_overwrites_stale_route() {
 }
 
 #[tokio::test]
-async fn echo_route_works() {
+async fn echo_route_is_rejected_no_loopback() {
     let secret = b"routing-test-secret";
     let config = ListenerConfig::new("127.0.0.1:0".parse().unwrap(), secret.to_vec())
         .with_fallback_target("");
@@ -104,11 +104,9 @@ async fn echo_route_works() {
     let payload = Bytes::from_static(b"echoing this");
     alice.send_frame(&Frame::new(echo_id, [42;8], payload.clone()).unwrap()).await.unwrap();
 
-    // Should get it back exactly as sent
-    let received = tokio::time::timeout(std::time::Duration::from_secs(2), alice.recv_frame()).await.unwrap().unwrap().unwrap();
-    assert_eq!(received.session_id, echo_id);
-    assert_eq!(received.nonce, [42;8]);
-    assert_eq!(received.payload, payload);
+    // Server must NOT echo back to alice - timeout expected
+    let received = tokio::time::timeout(std::time::Duration::from_millis(300), alice.recv_frame()).await;
+    assert!(received.is_err(), "relay must NOT echo frame back to sender");
 }
 
 /// Disconnect cleanup: after a peer disconnects, frames sent to its route ID

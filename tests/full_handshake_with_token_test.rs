@@ -60,7 +60,7 @@ async fn test_full_handshake_with_valid_token_success() {
 
     // 2. Client connects and sends Pseudo-TLS ClientHello with secret_token
     let mut client_stream = TcpStream::connect(relay_addr).await.unwrap();
-    let tls_builder = PseudoTlsBuilder::new(decoded_secret, "cloudflare.com");
+    let tls_builder = PseudoTlsBuilder::new(decoded_secret.clone(), "cloudflare.com");
     let client_hello = tls_builder.build();
     client_stream.write_all(&client_hello).await.unwrap();
     client_stream.flush().await.unwrap();
@@ -71,22 +71,48 @@ async fn test_full_handshake_with_valid_token_success() {
         .expect("Noise handshake must succeed with valid token");
     let mut framed = NoiseFramedStream::new(client_stream, noise_session);
 
-    // 4. Exchange encrypted Noise frames with Echo Service
-    let session_id: SessionId = [0xEE; 16];
+    let alice_id = [0x11u8; 32];
+    let bob_id = [0x22u8; 32];
+
+    // Register Alice
+    let reg_alice = Frame::new(
+        echomesh_relay::server::ROUTE_REGISTRATION_ID,
+        [0; 8],
+        Bytes::copy_from_slice(&alice_id),
+    ).unwrap();
+    framed.send_frame(&reg_alice).await.unwrap();
+
+    // Connect Bob
+    let mut bob_stream = TcpStream::connect(relay_addr).await.unwrap();
+    let bob_hello = PseudoTlsBuilder::new(decoded_secret, "cloudflare.com").build();
+    bob_stream.write_all(&bob_hello).await.unwrap();
+    bob_stream.flush().await.unwrap();
+    let bob_noise = client_noise_handshake(&mut bob_stream, &server_pub).await.unwrap();
+    let mut bob_framed = NoiseFramedStream::new(bob_stream, bob_noise);
+    let reg_bob = Frame::new(
+        echomesh_relay::server::ROUTE_REGISTRATION_ID,
+        [0; 8],
+        Bytes::copy_from_slice(&bob_id),
+    ).unwrap();
+    bob_framed.send_frame(&reg_bob).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Alice sends to Bob
     let nonce = [1, 2, 3, 4, 5, 6, 7, 8];
     let payload = Bytes::from_static(b"Secret validated frame payload!");
-    let frame = Frame::new(session_id, nonce, payload.clone()).unwrap();
-
+    let frame = Frame::new(bob_id[..16].try_into().unwrap(), nonce, payload.clone()).unwrap();
     framed.send_frame(&frame).await.unwrap();
 
-    let echo_frame = framed
-        .recv_frame()
-        .await
-        .unwrap()
-        .expect("must receive echoed frame from relay");
-    assert_eq!(echo_frame.session_id, session_id);
-    assert_eq!(echo_frame.nonce, nonce);
-    assert_eq!(echo_frame.payload, payload);
+    // Bob receives frame
+    let bob_frame = bob_framed.recv_frame().await.unwrap().expect("Bob receives frame");
+    assert_eq!(bob_frame.session_id, alice_id[..16]);
+    assert_eq!(bob_frame.nonce, nonce);
+    assert_eq!(bob_frame.payload, payload);
+
+    // Alice receives NO echo
+    let alice_echo = tokio::time::timeout(Duration::from_millis(200), framed.recv_frame()).await;
+    assert!(alice_echo.is_err(), "Relay must not echo frame back to sender");
 
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;
@@ -172,8 +198,8 @@ async fn test_insecure_no_token_bypass_allows_connection_without_valid_token() {
     let frame = Frame::new(session_id, nonce, payload.clone()).unwrap();
 
     framed.send_frame(&frame).await.unwrap();
-    let echo_frame = framed.recv_frame().await.unwrap().unwrap();
-    assert_eq!(echo_frame.payload, payload);
+    let echo_res = tokio::time::timeout(Duration::from_millis(200), framed.recv_frame()).await;
+    assert!(echo_res.is_err(), "Relay must reject echo loopback");
 
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;

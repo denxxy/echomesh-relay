@@ -301,10 +301,9 @@ where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
             continue;
         }
 
-        // 2. Development/debug echo loopback ONLY for explicit ECHO_ROUTE_ID
+        // 2. Reject echo route - EchoMesh is a routed messenger, not an echo server
         if frame.session_id == ECHO_ROUTE_ID {
-            info!("[server] ECHO_REQUEST connection=conn-{}", connection_id);
-            let _ = out_tx.send(frame).await;
+            warn!("[server] ECHO_ROUTE_REJECTED connection=conn-{} echo loopback is disabled", connection_id);
             continue;
         }
 
