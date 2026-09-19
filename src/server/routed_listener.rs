@@ -22,16 +22,68 @@ use crate::transport::obfuscation::{
 pub use super::config::{ListenerConfig, RelaySecrets};
 
 pub const ROUTE_REGISTRATION_ID: [u8; 16] = [0xF0; 16];
-const ECHO_ROUTE_ID: [u8; 16] = [0xEE; 16];
+pub const ECHO_ROUTE_ID: [u8; 16] = [0xEE; 16];
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
-type RouteId = [u8; 16];
+pub type RouteId = [u8; 16];
+pub type PeerId = [u8; 32];
 
 #[derive(Clone)]
-struct RouteEntry {
-    connection_id: u64,
-    tx: mpsc::Sender<Frame>,
+pub struct RouteEntry {
+    pub connection_id: u64,
+    pub peer_id: PeerId,
+    pub tx: mpsc::Sender<Frame>,
 }
-type RouteRegistry = Arc<RwLock<HashMap<RouteId, RouteEntry>>>;
+
+#[derive(Default)]
+pub struct RouteRegistryInner {
+    pub by_peer_id: HashMap<PeerId, RouteEntry>,
+    pub by_prefix: HashMap<RouteId, RouteEntry>,
+}
+
+impl RouteRegistryInner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, peer_id: PeerId, connection_id: u64, tx: mpsc::Sender<Frame>) -> Option<RouteEntry> {
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&peer_id[..16]);
+        let entry = RouteEntry {
+            connection_id,
+            peer_id,
+            tx,
+        };
+        self.by_prefix.insert(prefix, entry.clone());
+        self.by_peer_id.insert(peer_id, entry)
+    }
+
+    pub fn remove_connection(&mut self, peer_id: &PeerId, connection_id: u64) -> bool {
+        let is_current = self.by_peer_id.get(peer_id).map(|e| e.connection_id == connection_id).unwrap_or(false);
+        if is_current {
+            self.by_peer_id.remove(peer_id);
+            let mut prefix = [0u8; 16];
+            prefix.copy_from_slice(&peer_id[..16]);
+            self.by_prefix.remove(&prefix);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_by_peer_id(&self, peer_id: &PeerId) -> Option<RouteEntry> {
+        self.by_peer_id.get(peer_id).cloned()
+    }
+
+    pub fn get_by_prefix(&self, prefix: &RouteId) -> Option<RouteEntry> {
+        self.by_prefix.get(prefix).cloned()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.by_peer_id.len()
+    }
+}
+
+pub type RouteRegistry = Arc<RwLock<RouteRegistryInner>>;
 
 pub struct PrefixedStream<S> {
     prefix: Cursor<Vec<u8>>,
@@ -73,7 +125,7 @@ impl RelayListener {
         let mut validator = TokenValidator::new(config.secret_token.clone());
         if config.insecure_no_token { validator = validator.with_insecure_no_token(true); }
         info!(local_addr=%listener.local_addr()?, max_connections=config.max_connections, insecure_no_token=config.insecure_no_token, "echomesh routed listener bound");
-        Ok(Self { listener, semaphore, config: Arc::new(config), validator, routes: Arc::new(RwLock::new(HashMap::new())) })
+        Ok(Self { listener, semaphore, config: Arc::new(config), validator, routes: Arc::new(RwLock::new(RouteRegistryInner::new())) })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> { self.listener.local_addr() }
     pub fn active_connections(&self) -> usize { self.config.max_connections - self.semaphore.available_permits() }
@@ -166,45 +218,326 @@ where S:AsyncRead+AsyncWrite+Unpin+Send+'static {
     let (mut reader,mut writer)=tokio::io::split(stream);
     let (out_tx,mut out_rx)=mpsc::channel::<Frame>(256);
     let connection_id=NEXT_CONNECTION_ID.fetch_add(1,Ordering::Relaxed);
-    let writer_session=Arc::clone(&session);
-    let writer_task=tokio::spawn(async move {
-        while let Some(frame)=out_rx.recv().await {
-            let packet={let mut noise=writer_session.lock().await;noise.encrypt_frame(&frame)}?;
-            writer.write_all(&packet).await?;writer.flush().await?;
+    let writer_session = Arc::clone(&session);
+    let writer_conn_id = connection_id;
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            let msg_id = format!("msg_{}", u64::from_be_bytes(frame.nonce));
+            info!(
+                "[server] MESSAGE_FORWARD message_id={} connection_id={} write_started=true",
+                msg_id, writer_conn_id
+            );
+            let packet = {
+                let mut noise = writer_session.lock().await;
+                noise.encrypt_frame(&frame)
+            }?;
+            if let Err(err) = writer.write_all(&packet).await {
+                warn!(
+                    "[server] MESSAGE_FORWARD_RESULT message_id={} success=false error={}",
+                    msg_id, err
+                );
+                return Err(err.into());
+            }
+            if let Err(err) = writer.flush().await {
+                warn!(
+                    "[server] MESSAGE_FORWARD_RESULT message_id={} success=false error={}",
+                    msg_id, err
+                );
+                return Err(err.into());
+            }
+            info!(
+                "[server] MESSAGE_FORWARD_RESULT message_id={} success=true",
+                msg_id
+            );
         }
-        Ok::<(),Box<dyn std::error::Error+Send+Sync>>(())
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
 
-    let mut registered_route:Option<RouteId>=None;
+    let mut registered_peer: Option<PeerId> = None;
     loop {
-        let len=match reader.read_u16().await {Ok(v)=>v as usize,Err(err) if err.kind()==std::io::ErrorKind::UnexpectedEof=>break,Err(err)=>return Err(Box::new(err))};
-        if len==0||len>ENCRYPTED_FRAME_SIZE{
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData,format!("invalid encrypted frame length: {}",len))));
+        let len = match reader.read_u16().await {
+            Ok(v) => v as usize,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(Box::new(err)),
+        };
+        if len == 0 || len > ENCRYPTED_FRAME_SIZE {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid encrypted frame length: {}", len),
+            )));
         }
-        let mut buf=vec![0u8;len];reader.read_exact(&mut buf).await?;
-        let frame={let mut noise:tokio::sync::MutexGuard<'_,NoiseSession>=session.lock().await;noise.decrypt_frame(&buf)?};
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
+        let frame = {
+            let mut noise: tokio::sync::MutexGuard<'_, NoiseSession> = session.lock().await;
+            noise.decrypt_frame(&buf)?
+        };
 
-        if frame.session_id==ROUTE_REGISTRATION_ID {
-            if frame.payload.len()!=32 {warn!(payload_len=frame.payload.len(),"invalid route registration payload");continue;}
-            let mut route_id=[0u8;16];route_id.copy_from_slice(&frame.payload[..16]);
-            let previous=routes.write().await.insert(route_id,RouteEntry{connection_id,tx:out_tx.clone()});
-            if let Some(previous)=previous {debug!(previous_connection_id=previous.connection_id,connection_id,"route registration replaced stale connection");}
-            registered_route=Some(route_id);debug!(connection_id,"peer route registered");continue;
-        }
-        if frame.session_id==ECHO_ROUTE_ID {
-            out_tx.send(frame).await.map_err(|_|std::io::Error::new(std::io::ErrorKind::BrokenPipe,"relay writer closed"))?;
+        // 1. Route registration frame
+        if frame.session_id == ROUTE_REGISTRATION_ID {
+            if frame.payload.len() != 32 {
+                warn!(payload_len = frame.payload.len(), "invalid route registration payload");
+                continue;
+            }
+            let mut peer_id = [0u8; 32];
+            peer_id.copy_from_slice(&frame.payload[..32]);
+            let previous = routes.write().await.insert(
+                peer_id,
+                connection_id,
+                out_tx.clone(),
+            );
+            let id_hex = hex::encode(&peer_id);
+            info!(
+                "[server] REGISTER user={} connection=conn-{}",
+                id_hex, connection_id
+            );
+            if let Some(previous) = previous {
+                info!(
+                    "[server] RECONNECT user={} old_conn=conn-{} new_conn=conn-{}",
+                    id_hex, previous.connection_id, connection_id
+                );
+            }
+            registered_peer = Some(peer_id);
             continue;
         }
-        let Some(source_route)=registered_route else{warn!("dropping unregistered client frame");continue;};
-        let target=frame.session_id;let target_entry=routes.read().await.get(&target).cloned();
-        if let Some(entry)=target_entry {
-            let mut routed=frame;routed.session_id=source_route;
-            if entry.tx.send(routed).await.is_err(){routes.write().await.remove(&target);}
-        } else {debug!("recipient route not connected");}
+
+        // 2. Development/debug echo loopback ONLY for explicit ECHO_ROUTE_ID
+        if frame.session_id == ECHO_ROUTE_ID {
+            info!("[server] ECHO_REQUEST connection=conn-{}", connection_id);
+            let _ = out_tx.send(frame).await;
+            continue;
+        }
+
+        // 3. Authenticated sender verification
+        let Some(source_peer_id) = registered_peer else {
+            warn!("[server] DROP unregistered client frame connection=conn-{}", connection_id);
+            continue;
+        };
+
+        let mut source_prefix = [0u8; 16];
+        source_prefix.copy_from_slice(&source_peer_id[..16]);
+
+        // 4. Check if frame payload is a structured MessageEnvelope
+        if let Ok((envelope, client_msg)) = crate::protocol::codec::EnvelopeCodec::decode_client_message(&frame.payload) {
+            match client_msg {
+                crate::protocol::messages::ClientToServerMessage::SendMessage { recipient_id, data } => {
+                    let msg_id = envelope.message_id;
+                    let sender_hex = hex::encode(source_peer_id);
+                    let recipient_hex = hex::encode(recipient_id);
+
+                    info!(
+                        "[server] SEND_REQUEST message_id={} sender={} recipient={}",
+                        msg_id, sender_hex, recipient_hex
+                    );
+
+                    // Anti-self-messaging rule
+                    if source_peer_id == recipient_id {
+                        warn!(
+                            "[server] PROTOCOL_ERROR self_messaging_rejected message_id={} sender==recipient={}",
+                            msg_id, sender_hex
+                        );
+                        let resp = crate::protocol::messages::ServerToClientMessage::SendMessageResponse {
+                            message_id: msg_id,
+                            accepted: false,
+                        };
+                        if let Ok(resp_env) = crate::protocol::envelope::MessageEnvelope::new(
+                            resp.message_type(),
+                            msg_id,
+                            msg_id,
+                            envelope.timestamp,
+                            resp.encode(),
+                        ) {
+                            if let Ok(resp_bytes) = resp_env.to_bytes() {
+                                if let Ok(resp_frame) = Frame::new(source_prefix, [0u8; 8], resp_bytes) {
+                                    let _ = out_tx.send(resp_frame).await;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    let target_entry = routes.read().await.get_by_peer_id(&recipient_id);
+                    if let Some(entry) = target_entry {
+                        info!(
+                            "[server] ROUTE recipient={} connection=conn-{}",
+                            recipient_hex, entry.connection_id
+                        );
+
+                        // 1. Send SendMessageResponse { accepted: true } to sender
+                        let resp = crate::protocol::messages::ServerToClientMessage::SendMessageResponse {
+                            message_id: msg_id,
+                            accepted: true,
+                        };
+                        if let Ok(resp_env) = crate::protocol::envelope::MessageEnvelope::new(
+                            resp.message_type(),
+                            msg_id,
+                            msg_id,
+                            envelope.timestamp,
+                            resp.encode(),
+                        ) {
+                            if let Ok(resp_bytes) = resp_env.to_bytes() {
+                                if let Ok(resp_frame) = Frame::new(source_prefix, [0u8; 8], resp_bytes) {
+                                    let _ = out_tx.send(resp_frame).await;
+                                }
+                            }
+                        }
+
+                        // 2. Send IncomingMessageEvent to recipient
+                        let evt = crate::protocol::messages::ServerToClientMessage::IncomingMessageEvent {
+                            sender_id: source_peer_id,
+                            data,
+                        };
+                        if let Ok(evt_env) = crate::protocol::envelope::MessageEnvelope::new(
+                            evt.message_type(),
+                            msg_id,
+                            0,
+                            envelope.timestamp,
+                            evt.encode(),
+                        ) {
+                            if let Ok(evt_bytes) = evt_env.to_bytes() {
+                                if let Ok(evt_frame) = Frame::new(source_prefix, frame.nonce, evt_bytes) {
+                                    if entry.tx.send(evt_frame).await.is_ok() {
+                                        info!("[server] FORWARD_OK message_id={}", msg_id);
+                                    } else {
+                                        routes.write().await.remove_connection(&entry.peer_id, entry.connection_id);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        info!(
+                            "[server] ROUTE recipient={} recipient_found=false",
+                            recipient_hex
+                        );
+                        // Offline recipient: Send SendMessageResponse { accepted: false }, DO NOT ECHO
+                        let resp = crate::protocol::messages::ServerToClientMessage::SendMessageResponse {
+                            message_id: msg_id,
+                            accepted: false,
+                        };
+                        if let Ok(resp_env) = crate::protocol::envelope::MessageEnvelope::new(
+                            resp.message_type(),
+                            msg_id,
+                            msg_id,
+                            envelope.timestamp,
+                            resp.encode(),
+                        ) {
+                            if let Ok(resp_bytes) = resp_env.to_bytes() {
+                                if let Ok(resp_frame) = Frame::new(source_prefix, [0u8; 8], resp_bytes) {
+                                    let _ = out_tx.send(resp_frame).await;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                crate::protocol::messages::ClientToServerMessage::Ack { acknowledged_message_id } => {
+                    info!("[server] DELIVERED message_id={}", acknowledged_message_id);
+                    let target_prefix = frame.session_id;
+                    if let Some(entry) = routes.read().await.get_by_prefix(&target_prefix) {
+                        let evt = crate::protocol::messages::ServerToClientMessage::DeliveryStatusEvent {
+                            message_id: acknowledged_message_id,
+                            status: crate::protocol::messages::DeliveryStatus::Delivered,
+                        };
+                        if let Ok(evt_env) = crate::protocol::envelope::MessageEnvelope::new(
+                            evt.message_type(),
+                            acknowledged_message_id,
+                            acknowledged_message_id,
+                            envelope.timestamp,
+                            evt.encode(),
+                        ) {
+                            if let Ok(evt_bytes) = evt_env.to_bytes() {
+                                if let Ok(evt_frame) = Frame::new(source_prefix, [0u8; 8], evt_bytes) {
+                                    let _ = entry.tx.send(evt_frame).await;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                crate::protocol::messages::ClientToServerMessage::Heartbeat { sequence } => {
+                    let resp = crate::protocol::messages::ServerToClientMessage::HeartbeatResponse { sequence };
+                    if let Ok(resp_env) = crate::protocol::envelope::MessageEnvelope::new(
+                        resp.message_type(),
+                        envelope.message_id,
+                        envelope.message_id,
+                        envelope.timestamp,
+                        resp.encode(),
+                    ) {
+                        if let Ok(resp_bytes) = resp_env.to_bytes() {
+                            if let Ok(resp_frame) = Frame::new(source_prefix, [0u8; 8], resp_bytes) {
+                                let _ = out_tx.send(resp_frame).await;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // 5. Raw frame routing (compatible with standard wire frames and delivery ACK)
+        let target = frame.session_id;
+        let msg_id = format!("msg_{}", u64::from_be_bytes(frame.nonce));
+        let sender_hex = hex::encode(source_prefix);
+        let recipient_hex = hex::encode(target);
+
+        // Anti-self-messaging rule
+        if source_prefix == target {
+            warn!(
+                "[server] SELF_MESSAGING_DETECTED message_id={} sender_id==recipient_id={}",
+                msg_id, sender_hex
+            );
+            continue; // Dropped without echoing
+        }
+
+        let is_ack = frame.payload.first() == Some(&0x06);
+        if is_ack {
+            let ack_id = String::from_utf8_lossy(&frame.payload[1..]).to_string();
+            info!(
+                "[server] DELIVERED message_id={} to_sender={}",
+                ack_id, recipient_hex
+            );
+        } else {
+            info!(
+                "[server] SEND_REQUEST message_id={} sender={} recipient={}",
+                msg_id, sender_hex, recipient_hex
+            );
+        }
+
+        let target_entry = routes.read().await.get_by_prefix(&target);
+        if let Some(entry) = target_entry {
+            info!(
+                "[server] ROUTE recipient={} recipient_found=true recipient_connection_id=conn-{}",
+                recipient_hex, entry.connection_id
+            );
+            let mut routed = frame;
+            routed.session_id = source_prefix;
+            if entry.tx.send(routed).await.is_ok() {
+                if !is_ack {
+                    info!("[server] FORWARD_OK message_id={}", msg_id);
+                }
+            } else {
+                routes.write().await.remove_connection(&entry.peer_id, entry.connection_id);
+            }
+        } else {
+            info!(
+                "[server] ROUTE recipient={} recipient_found=false",
+                recipient_hex
+            );
+            // RECIPIENT OFFLINE: DO NOT ECHO BACK TO SENDER
+        }
     }
 
-    if let Some(route_id)=registered_route {
-        let mut guard=routes.write().await;let remove=guard.get(&route_id).map(|entry|entry.connection_id==connection_id).unwrap_or(false);if remove{guard.remove(&route_id);}
+    if let Some(peer_id) = registered_peer {
+        let removed = routes.write().await.remove_connection(&peer_id, connection_id);
+        if removed {
+            info!(
+                "[server] UNREGISTER user={} connection=conn-{}",
+                hex::encode(&peer_id), connection_id
+            );
+        }
     }
-    drop(out_tx);let _=writer_task.await;Ok(())
+    drop(out_tx);
+    let _ = writer_task.await;
+    Ok(())
 }

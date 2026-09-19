@@ -241,3 +241,68 @@ async fn wrong_token_rejected() {
     assert!(result.is_err() || result.unwrap().is_err(),
         "relay must not complete Noise handshake for wrong token");
 }
+
+#[tokio::test]
+async fn client_to_client_delivery_ack_exchange() {
+    let secret = b"routing-ack-test-secret-32-bytes";
+    let config = ListenerConfig::new("127.0.0.1:0".parse().unwrap(), secret.to_vec())
+        .with_fallback_target("");
+    let listener = RelayListener::bind(config).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let public = listener.secrets().public_key.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(async move { listener.run_with_shutdown(shutdown_rx).await.unwrap(); });
+
+    let alice_id = [0xAA; 32];
+    let bob_id = [0xBB; 32];
+
+    let mut alice = connect_client(addr, &public, secret, alice_id).await;
+    let mut bob = connect_client(addr, &public, secret, bob_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // 1. Alice sends chat message to Bob
+    let msg_id = b"msg_1726700000000";
+    let text_payload = Bytes::from_static(b"Hello Bob from Alice!");
+    let send_nonce = 1726700000000u64.to_be_bytes();
+    alice.send_frame(&Frame::new(bob_id[..16].try_into().unwrap(), send_nonce, text_payload.clone()).unwrap()).await.unwrap();
+
+    // 2. Bob receives message
+    let bob_received = tokio::time::timeout(std::time::Duration::from_secs(2), bob.recv_frame()).await.unwrap().unwrap().unwrap();
+    assert_eq!(bob_received.session_id, alice_id[..16]);
+    assert_eq!(bob_received.payload, text_payload);
+    assert_eq!(bob_received.nonce, send_nonce);
+
+    // 3. Bob sends Delivery ACK back to Alice with discriminator 0x06 + msg_id
+    let mut ack_payload = vec![0x06u8];
+    ack_payload.extend_from_slice(msg_id);
+    let ack_nonce = 1726700000050u64.to_be_bytes();
+    bob.send_frame(&Frame::new(bob_received.session_id, ack_nonce, Bytes::from(ack_payload)).unwrap()).await.unwrap();
+
+    // 4. Alice receives Delivery ACK
+    let alice_received = tokio::time::timeout(std::time::Duration::from_secs(2), alice.recv_frame()).await.unwrap().unwrap().unwrap();
+    assert_eq!(alice_received.session_id, bob_id[..16]);
+    assert_eq!(alice_received.payload.first(), Some(&0x06));
+    assert_eq!(&alice_received.payload[1..], msg_id);
+
+    // 5. Verify symmetrical exchange: Bob sends to Alice, Alice ACKs to Bob
+    let bob_text = Bytes::from_static(b"Hello Alice from Bob!");
+    let bob_nonce = 1726700000100u64.to_be_bytes();
+    bob.send_frame(&Frame::new(alice_id[..16].try_into().unwrap(), bob_nonce, bob_text.clone()).unwrap()).await.unwrap();
+
+    let alice_received_msg = tokio::time::timeout(std::time::Duration::from_secs(2), alice.recv_frame()).await.unwrap().unwrap().unwrap();
+    assert_eq!(alice_received_msg.session_id, bob_id[..16]);
+    assert_eq!(alice_received_msg.payload, bob_text);
+
+    let mut alice_ack_payload = vec![0x06u8];
+    alice_ack_payload.extend_from_slice(b"msg_1726700000100");
+    alice.send_frame(&Frame::new(alice_received_msg.session_id, [0; 8], Bytes::from(alice_ack_payload)).unwrap()).await.unwrap();
+
+    let bob_received_ack = tokio::time::timeout(std::time::Duration::from_secs(2), bob.recv_frame()).await.unwrap().unwrap().unwrap();
+    assert_eq!(bob_received_ack.session_id, alice_id[..16]);
+    assert_eq!(bob_received_ack.payload.first(), Some(&0x06));
+    assert_eq!(&bob_received_ack.payload[1..], b"msg_1726700000100");
+
+    let _ = shutdown_tx.send(true);
+    let _ = task.await;
+}
+
